@@ -10,14 +10,21 @@ from .i18n import hien_thi_loai_hinh
 from .models import Exam, PrepViolation, ScheduledExam
 
 
-def schedule_to_dataframe(scheduled: List[ScheduledExam]) -> pd.DataFrame:
+def schedule_to_dataframe(
+    scheduled: List[ScheduledExam],
+    exams: List[Exam] | None = None,
+) -> pd.DataFrame:
+    exam_map = {e.exam_id: e for e in exams} if exams else {}
     rows = []
     for s in scheduled:
+        ex = exam_map.get(s.exam_id)
+        tin_chi = float(ex.credits) if ex else None
         rows.append(
             {
                 "Ma_ca_thi": s.exam_id,
                 "Ma_hoc_phan": s.course_id,
                 "Ten_mon": s.course_name,
+                "So_tin_chi": tin_chi,
                 "Ngay_thi": s.exam_date.isoformat(),
                 "So_ca": s.session,
                 "Ky_hieu_ca": getattr(s, "session_label", ""),
@@ -64,6 +71,7 @@ def student_view_dataframe(
                     "Ma_ca_thi": item.exam_id,
                     "Ma_hoc_phan": exam.course_id,
                     "Ten_mon": exam.course_name,
+                    "So_tin_chi": float(exam.credits),
                     "Loai_hinh_thi": hien_thi_loai_hinh(exam.exam_type),
                     "Ngay_thi": item.exam_date.isoformat(),
                     "So_ca": item.session,
@@ -89,6 +97,7 @@ def exam_view_dataframe(scheduled: List[ScheduledExam], exams: List[Exam]) -> pd
                 "Ma_ca_thi": item.exam_id,
                 "Ma_hoc_phan": item.course_id,
                 "Ten_mon": item.course_name,
+                "So_tin_chi": float(exam.credits),
                 "Loai_hinh_thi": hien_thi_loai_hinh(exam.exam_type),
                 "Ngay_thi": item.exam_date.isoformat(),
                 "So_ca": item.session,

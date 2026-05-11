@@ -463,7 +463,7 @@ with tabs[0]:
 
     # Ma trận số môn theo ngày × ca
     st.markdown("**Số môn theo ngày và ký hiệu ca**")
-    schedule_df = schedule_to_dataframe(result.scheduled)
+    schedule_df = schedule_to_dataframe(result.scheduled, exams)
     if not schedule_df.empty:
         pivot = (
             schedule_df.groupby(["Ngay_thi", "Ky_hieu_ca"]).size().unstack(fill_value=0)
@@ -680,7 +680,7 @@ with tabs[5]:
 # ---- Export ----
 st.markdown("---")
 st.subheader("📦 Xuất file Excel")
-schedule_df = schedule_to_dataframe(result.scheduled)
+schedule_df = schedule_to_dataframe(result.scheduled, exams)
 vios_df = violations_to_dataframe(violations)
 student_df = student_view_dataframe(result.scheduled, exams, student_name_map)
 

@@ -1,0 +1,36 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE / OS files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local data and generated outputs
+data/*.xlsx
+data/*.csv
+data/*.parquet
+data/*.json
+!data/.gitkeep
+
+# Streamlit local state/logs
+.streamlit/
+*.log
+*.tmp

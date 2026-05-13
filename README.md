@@ -3,57 +3,67 @@
 Phần mềm xếp lịch thi cho trường đại học hệ tín chỉ, hỗ trợ cán bộ phòng đào tạo:
 xếp lịch nhanh – đúng ràng buộc – tự tách môn lớn – tự repair khi đổi lịch thủ công.
 
-> **Phiên bản v3 (2026-05)** – pipeline lai 4 lớp:
-> **Diagnose → Greedy DSATUR (với load-balance & soft-cap) → LNS move-based → CP-SAT polish.**
-> Luôn ra lịch khả thi với dataset 1,000+ môn × 16,000+ sinh viên, peak SV/ca có kiểm soát.
+> **Phiên bản v3 (2026-05)** — pipeline: **Diagnose → Greedy (khóa ưu tiên, Khoa_nhom, load-balance, soft-cap) → LNS → CP-SAT polish.**  
+> Chi tiết nghiệp vụ và ràng buộc: [mục 3 — Logic xếp lịch & nghiệp vụ](#3-logic-xếp-lịch--nghiệp-vụ).
 
 ---
 
-## 🎯 Mục lục
+## Mục lục
 
-1. [Khởi động nhanh](#1-khởi-động-nhanh-cho-cán-bộ-xếp-lịch)
+1. [Cài đặt và khởi động](#1-cài-đặt-và-khởi-động)
 2. [File đầu vào](#2-file-đầu-vào)
-3. [Hướng dẫn từng bước](#3-hướng-dẫn-từng-bước-trên-giao-diện)
-4. [Hiểu các thông số trong sidebar](#4-hiểu-các-thông-số-trong-sidebar)
-5. [Đọc kết quả & 6 tab](#5-đọc-kết-quả--6-tab)
-6. [Kịch bản xử lý sự cố thường gặp](#6-kịch-bản-xử-lý-sự-cố-thường-gặp)
-7. [Kiến trúc kỹ thuật](#7-kiến-trúc-kỹ-thuật-dành-cho-dev)
-8. [Benchmark thực tế](#8-benchmark-thực-tế)
-9. [Cấu trúc thư mục](#9-cấu-trúc-thư-mục)
-10. [Hướng nâng cấp tiếp](#10-hướng-nâng-cấp-tiếp)
+3. [Logic xếp lịch & nghiệp vụ](#3-logic-xếp-lịch--nghiệp-vụ)
+4. [Hướng dẫn từng bước](#4-hướng-dẫn-từng-bước-trên-giao-diện)
+5. [Hiểu các thông số trong sidebar](#5-hiểu-các-thông-số-trong-sidebar)
+6. [Đọc kết quả & 6 tab](#6-đọc-kết-quả--6-tab)
+7. [Kịch bản xử lý sự cố thường gặp](#7-kịch-bản-xử-lý-sự-cố-thường-gặp)
+8. [Kiến trúc kỹ thuật](#8-kiến-trúc-kỹ-thuật-dành-cho-dev)
+9. [Benchmark thực tế](#9-benchmark-thực-tế)
+10. [Cấu trúc thư mục](#10-cấu-trúc-thư-mục)
+11. [Hướng nâng cấp tiếp](#11-hướng-nâng-cấp-tiếp)
 
 ---
 
-## 1. Khởi động nhanh (cho cán bộ xếp lịch)
+## 1. Cài đặt và khởi động
 
-### Cách A — Script tự động (khuyên dùng sau khi clone)
+### 1.1 Cài đặt lần đầu (Windows)
 
-Cần **Python 3.10+** đã cài sẵn ([python.org](https://www.python.org/downloads/) — Windows nhớ tick *Add python.exe to PATH*).
+1. **Cài Git** — tải từ [git-scm.com/download/win](https://git-scm.com/download/win), cài xong mở **cmd** hoặc **PowerShell** và kiểm tra `git --version`.
+2. **Clone repo** — chọn thư mục chứa mã nguồn, rồi (thay URL bằng địa chỉ repo thật của bạn):
+   ```cmd
+   git clone https://github.com/USER/ExamScheduling.git
+   cd ExamScheduling
+   ```
+3. **Cài Python 3.10+** — một trong hai cách (khuyên dùng một cách thôi):
+   - **Microsoft Store**: mở Store, tìm **Python 3.11** hoặc **Python 3.12**, bấm Cài đặt; hoặc
+   - **python.org**: [Windows downloads](https://www.python.org/downloads/windows/) — khi cài, bật **Add python.exe to PATH** (hoặc dùng nút *Manage app execution aliases* và tắt alias «App Installer» nếu `python` trỏ nhầm).
+4. **Chạy `setup.bat`** — trong thư mục repo, double-click `setup.bat` **hoặc**:
+   ```cmd
+   setup.bat
+   ```
+   File này gọi `setup.py --run`: tạo `.venv`, cài `requirements.txt`, rồi **mở luôn** ứng dụng Streamlit trong trình duyệt.
 
-| Hệ điều hành | Lệnh |
-|---|---|
-| **macOS / Linux** | `./setup.sh` hoặc `python3 setup.py` |
-| **Windows (CMD)** | Double-click `setup.bat` hoặc `setup.bat` trong thư mục repo |
-| **Windows / mọi nền** | `python setup.py` hoặc `py -3 setup.py` |
+Nếu không muốn tự mở app: `py -3 setup.py` hoặc `python setup.py` (không thêm `--run`), sau đó chạy thủ công:
 
-Script tạo `.venv`, nâng cấp `pip`, cài `requirements.txt`, rồi in lệnh chạy Streamlit.
-
-### Cách B — Thủ công
-
-```bash
-# Cài đặt 1 lần
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-
-# Chạy app
-.venv/bin/streamlit run app.py
+```cmd
+.venv\Scripts\streamlit run app.py
 ```
 
-Mở trình duyệt tại `http://localhost:8501`, upload 2 file (kế hoạch thi + danh sách đăng ký),
-giữ nguyên các thiết lập mặc định, bấm **🚀 Xếp lịch thi**. Sau ~20–40 giây sẽ có lịch.
+### 1.2 macOS / Linux
 
-> 💡 Nếu lần đầu chưa quen, **chỉ cần upload 2 file rồi bấm chạy** — mọi tham số mặc định
-> đã được tinh chỉnh cho dataset 1,000+ môn.
+Cần **Python 3.10+** (ví dụ `brew install python@3.12` trên macOS).
+
+| Cách | Lệnh |
+|---|---|
+| Script | `./setup.sh` hoặc `python3 setup.py` (thêm `--run` nếu muốn mở Streamlit ngay) |
+| Thủ công | `python3 -m venv .venv` → `.venv/bin/pip install -r requirements.txt` → `.venv/bin/streamlit run app.py` |
+
+### 1.3 Dùng app (sau khi môi trường sẵn sàng)
+
+Mở trình duyệt tại `http://localhost:8501`, upload **kế hoạch thi** + **danh sách đăng ký**,
+giữ mặc định sidebar nếu chưa quen, bấm **Xếp lịch thi**. Thời gian chạy phụ thuộc quy mô (thường vài chục giây đến vài phút).
+
+> Gợi ý: lần đầu chỉ cần đủ hai file bắt buộc rồi bấm chạy; các tham số mặc định đã được chỉnh cho bài toán lớn (hàng nghìn môn).
 
 ---
 
@@ -80,17 +90,20 @@ Hệ thống lấy `min(Ngày BD)` → `max(Ngày kết thúc)` làm cửa sổ.
 
 Hệ thống tự suy luận:
 - `CourseID` từ 12 ký tự đầu của `MalopHP`.
+- **Khoa_nhom** = **4 ký tự cuối** `MalopHP`: hai **môn khác học phần** mà cùng một hậu tố này **không được xếp thi cùng một ngày** (Greedy, LNS và CP-SAT đều áp). Các **ca tách cùng một học phần** (cùng 7 ký tự đầu MalopHP hoặc cùng `CourseID`) được **miễn** quy tắc này giữa các ca với nhau.
 - `ExamType`: `theory` / `oral` / `computer` từ tên môn (qua từ khoá).
-- **Môn thi chung**: bất kỳ môn nào có ≥ 2 lớp học phần → gộp 1 đề thi chung.
+- **Môn thi chung**: môn có từ **3 lớp học phần trở lên** (ngưỡng cấu hình được, mặc định ≥3) → gộp một đề thi chung (trừ khi tách môn lớn tạo thêm ca).
 
-### 2.3 ⚙️ Tuỳ chọn – Phòng thi
+### 2.3 Tuỳ chọn – Phòng thi
 
 | Cột | Bắt buộc | Ý nghĩa |
 |---|---|---|
-| `RoomID` | ✅ | Mã phòng |
-| `Location` | ✅ | Vị trí (toà nhà / khu) |
-| `Capacity` | ✅ | Sức chứa (số chỗ) |
-| `RoomType` | – | `theory` / `computer` / `any` |
+| `RoomID` | Có | Mã phòng |
+| `Capacity` | Có | Sức chứa (số chỗ) |
+| `Location` / `Khu` | Không | Vị trí hiển thị (có thể để trống) |
+| `RoomType` | Không | `theory` / `computer` / `any` — khớp bảng mã hình thức thi |
+
+Khi một môn cần **nhiều phòng**, bước phân phòng **ưu tiên gom phòng cùng khu**: **khu = ký tự đầu của `RoomID`** (ví dụ `B101` và `B205` cùng khu `B`), không dựa vào cột `Location`.
 
 ### 2.4 ⚙️ Tuỳ chọn – Giám thị
 
@@ -103,7 +116,52 @@ Hệ thống tự suy luận:
 
 ---
 
-## 3. Hướng dẫn từng bước trên giao diện
+## 3. Logic xếp lịch & nghiệp vụ
+
+Phần này mô tả **đúng hành vi hiện tại** của app (Streamlit `app.py` + thư mục `engine/`), giúp cán bộ và dev cùng ngôn ngữ.
+
+### 3.1 Đơn vị xếp lịch: theo ca thi (Exam), không theo từng sinh viên
+
+- Từ file DSSV, hệ thống gom đăng ký thành danh sách **ca thi** (`Exam`): mỗi ca có `student_ids`, `section_ids` (MalopHP), loại hình thi, v.v.
+- Greedy / LNS / CP-SAT gán **ô thời gian (slot) cho từng ca**, theo thứ tự ưu tiên và đồ thị xung đột.
+- **Sinh viên** dùng để: biết hai ca nào **không được trùng slot** (chung SV); giới hạn **số môn/SV/ngày**; tính **ngày ôn** (prep) mềm/cứng; không có vòng lặp «lần lượt mỗi SV rồi tìm chỗ».
+
+### 3.2 MalopHP: 7 ký tự đầu, 4 ký tự cuối, và 2 số «khóa»
+
+| Khái niệm | Cách lấy | Dùng cho |
+|---|---|---|
+| Tiền tố học phần | **7 ký tự đầu** `MalopHP` | Gom «môn đông» theo ngưỡng SV; các **ca tách cùng học phần** phải cùng **buổi** (sáng/chiều) khi bật tách đề. |
+| **Khoa_nhom** | **4 ký tự cuối** `MalopHP` | Hai **học phần khác nhau** có cùng hậu tố → **không thi cùng một ngày** (cứng: Greedy, LNS, CP-SAT). **Miễn** giữa các ca **cùng học phần** (cùng 7 ký tự đầu hoặc cùng `CourseID`). |
+| **Chỉ số khóa (ưu tiên xếp)** | **2 ký tự đầu** của 4 ký tự cuối, phải là chữ số (vd `2510` → `25`) | Trên mỗi ca lấy **max** theo mọi MalopHP của ca: số **càng lớn** → xếp **trước** trong Greedy để chiếm slot tốt hơn (ưu tiên SV khóa mới / ít môn). |
+
+### 3.3 Tách môn lớn và trần SV mỗi ca
+
+- Khi bật «Tách môn lớn» và đặt **ngưỡng SV tối đa / 1 ca**: đó là **trần cứng** — **không ca nào** được vượt quá số SV đó (kể cả một MalopHP rất đông hoặc sau khi FFD gom lớp).
+- Quy trình gần đúng: chia nhóm theo lớp (FFD theo quy mô) → với mỗi nhóm, **cắt thêm** danh sách SV theo từng khúc ≤ ngưỡng → sinh thêm ca nếu cần.
+- Tên hiển thị: `(đề k/N)`; nếu một đề phải tách thêm theo SV: `— nhóm j/n`.
+
+### 3.4 Pipeline sau khi bấm «Xếp lịch thi»
+
+1. **Chẩn đoán trước** (`diagnose`): khả thi sơ bộ, mật độ xung đột, Khoa_nhom vs số ngày, v.v.
+2. **Greedy** (`heuristic.schedule_greedy`): đặt lần lượt từng ca vào slot hợp lệ, chấm điểm slot (cân tải, prep mềm, PBL muộn, soft cap, repair). **Thứ tự ca**: khóa số (2 chữ) giảm dần → `priority` (PBL) → bậc xung đột → quy mô SV. **Prep mềm**: ca thuộc **khóa cũ hơn** (so với khóa lớn nhất trong đợt) có **trọng số phạt prep thấp hơn** (chấp nhận dễ xếp «chật» hơn).
+3. **Nới ràng buộc (tuỳ chọn)**: capacity tổng phòng → `max môn/SV/ngày` → cuối cùng mới cho **trùng SV trên cùng slot** (last resort, có log). **Khoa_nhom** và **trùng slot do SV** ở các bước trước vẫn cứng.
+4. **LNS** (`lns_improve`): thử chuyển ca vi phạm prep sang slot khác (vẫn kiểm Khoa_nhom, xung đột, v.v.).
+5. **CP-SAT** (nếu đủ nhỏ): đánh bóng nghiệm, warm-start từ Greedy+LNS; có ràng buộc **ngày khác nhau** cho cặp ca vi phạm Khoa_nhom (học phần khác nhau).
+
+### 3.5 Phân phòng và «cùng khu»
+
+- Sau khi có **ngày + ca** cho từng môn: `assign_rooms_and_invigilators` gán phòng + giám thị theo loại hình thi và sức chứa.
+- **Cùng khu** khi cần nhiều phòng: **ký tự đầu của `RoomID`** (in hoa), không dùng cột `Location`.
+
+### 3.6 Đổi lịch thủ công & xuất
+
+- Tab đổi lịch: gửi lại solver với `fixed_slots` (ca đổi khóa vào slot mới), các ca khác **repair** gần lịch cũ (hàm mục tiêu khoảng cách slot).
+- Ghim lịch mâu thuẫn **Khoa_nhom** có thể bị bỏ ghim và ghi trong log nới ràng buộc.
+- Xuất Excel: nhiều sheet (lịch thi, vi phạm prep, theo SV, KPI) — xem [mục kết quả & tab](#6-đọc-kết-quả--6-tab).
+
+---
+
+## 4. Hướng dẫn từng bước trên giao diện
 
 ### Bước 1: Upload file
 1. Mở `http://localhost:8501`.
@@ -120,12 +178,12 @@ Mặc định đã tốt — nhưng nên xem qua các expander:
 - **Solver & tối ưu** – thời gian tối đa cho CP-SAT polish.
 - **Phòng & giám thị** – số giám thị/phòng (mặc định 2).
 
-### Bước 3: Bấm "🚀 Xếp lịch thi"
+### Bước 3: Bấm nút xếp lịch thi
 - Progress bar cho biết các pha: Greedy → LNS → CP-SAT (nếu instance nhỏ).
 - Hoàn tất sẽ tự cuộn xuống phần kết quả.
 
 ### Bước 4: Kiểm tra kết quả qua 6 tab → xuất Excel
-Xem mục [§5](#5-đọc-kết-quả--6-tab).
+Xem mục [kết quả & tab](#6-đọc-kết-quả--6-tab).
 
 ### Bước 5 (nếu cần): Đổi lịch thủ công
 - Vào tab **✍️ Đổi lịch thủ công**.
@@ -135,7 +193,7 @@ Xem mục [§5](#5-đọc-kết-quả--6-tab).
 
 ---
 
-## 4. Hiểu các thông số trong sidebar
+## 5. Hiểu các thông số trong sidebar
 
 ### Tham số học vụ
 
@@ -145,15 +203,16 @@ Xem mục [§5](#5-đọc-kết-quả--6-tab).
 | Số ngày ôn tối thiểu (cứng) | 0.0 | Nếu >0 → ép cứng `\|day_i − day_j\| ≥ ⌈x⌉` cho cặp xung đột. |
 | Max môn / SV / ngày | 2 | Số đề thi tối đa 1 SV được phép thi/ngày. |
 
+**Ưu tiên khóa (tự động — không có ô tắt trên UI):** Greedy xếp ca có **mã khóa** (2 chữ số đầu của 4 ký tự cuối `MalopHP`) **lớn hơn** trước; phạt **prep-day mềm** nhẹ hơn với ca chủ yếu **khóa cũ** trong đợt. Chi tiết: [mục 3](#3-logic-xếp-lịch--nghiệp-vụ).
+
 ### Tách môn lớn (auto-split) ✨
 
 | Thông số | Mặc định | Ý nghĩa |
 |---|---|---|
 | Bật tách môn lớn | ✅ | Khuyến nghị bật cho trường có môn chung lớn (>1,500 SV). |
-| Ngưỡng SV tối đa / 1 ca thi | 1,500 | Môn vượt ngưỡng → tự chia thành `⌈size/ngưỡng⌉` ca khác nhau, mỗi ca có **đề riêng**. |
+| Ngưỡng SV tối đa / 1 ca thi | 1,500 | **Trần cứng** số SV mỗi ca: không ca nào vượt ngưỡng. Môn vượt tổng SV → chia nhiều ca (đề riêng); sau khi gom theo lớp (FFD), từng ca vẫn có thể **cắt thêm theo danh sách SV** nếu một nhóm lớp vẫn quá đông. |
 
-> 📌 Khi tách, hệ thống chia `MalopHP` thành các nhóm bằng FFD (cân kích thước),
-> đặt tên mới là `<Tên môn> (đề k/N)`. Mỗi đề có tập SV riêng (không trùng), thi ca khác nhau.
+> Khi tách, tên ca có dạng `<Tên môn> (đề k/N)`; nếu một đề phải tách thêm theo SV: thêm hậu tố `— nhóm j/n`.
 
 ### Phân bố tải
 
@@ -176,7 +235,7 @@ Xem mục [§5](#5-đọc-kết-quả--6-tab).
 
 ---
 
-## 5. Đọc kết quả & 6 tab
+## 6. Đọc kết quả & 6 tab
 
 ### Tab 1 – 📊 Tổng quan & KPI
 
@@ -198,7 +257,7 @@ Phía dưới có **biểu đồ tải SV theo ngày** + **heatmap (Ngày × Ca)
 ### Tab 2 – 🔍 Chẩn đoán
 
 - Cặp xung đột & mật độ.
-- **Cảnh báo cứng** (đỏ): khi giải KHÔNG THỂ thoả hết (cần điều chỉnh đầu vào).
+- **Cảnh báo cứng** (đỏ): ví dụ không đủ ngày cho số môn/SV; **Khoa_nhom**: một hậu tố 4 ký tự cuối MalopHP gắn quá nhiều **môn khác nhau** so với số ngày đợt thi.
 - **Cảnh báo mềm** (vàng): ví dụ "có 17 môn > 1,000 SV — bật tách môn lớn".
 - Top 15 môn có nhiều vi phạm prep nhất.
 
@@ -233,7 +292,14 @@ Cuối trang có nút **⬇️ Tải xuống `ket_qua_xep_lich_thi.xlsx`** với
 
 ---
 
-## 6. Kịch bản xử lý sự cố thường gặp
+## 7. Kịch bản xử lý sự cố thường gặp
+
+### Lỗi Khoa_nhom (chẩn đoán trước khi chạy)
+
+| Triệu chứng | Cách xử lý |
+|---|---|
+| Một hậu tố 4 ký tự cuối MalopHP gắn quá nhiều **môn khác nhau** so với số **ngày** trong kế hoạch thi | Mở rộng đợt thi (thêm ngày), hoặc điều chỉnh mã lớp / nhóm tách sao cho không dồn cùng một `Khoa_nhom` cho quá nhiều học phần độc lập. |
+| Ghim lịch thủ công (`fixed_slots`) báo bỏ ghim / mâu thuẫn | Hai môn khác học phần cùng `Khoa_nhom` không thể cùng ngày; chọn ngày khác hoặc bỏ ghim một trong hai. |
 
 ### "Vô nghiệm" / treo quá lâu
 
@@ -266,41 +332,43 @@ Cuối trang có nút **⬇️ Tải xuống `ket_qua_xep_lich_thi.xlsx`** với
 
 ---
 
-## 7. Kiến trúc kỹ thuật (dành cho dev)
+## 8. Kiến trúc kỹ thuật (dành cho dev)
 
 ```
 ┌─────────────────────────────────────────────────────┐
 │ engine/io.py                                        │
-│  • Đọc Excel, gộp lớp thành môn thi chung           │
-│  • Auto-split môn lớn (FFD theo size)               │
+│  • Đọc Excel, gộp lớp thành môn thi chung (ngưỡng ≥3 lớp) │
+│  • Auto-split môn lớn: FFD theo lớp + cắt cứng theo max SV/ca │
 └─────────────────┬───────────────────────────────────┘
                   │
 ┌─────────────────▼───────────────────────────────────┐
 │ engine/diagnostics.py                               │
-│  • Pre-flight: bottleneck, môn quá lớn, mật độ      │
+│  • Pre-flight: bottleneck, môn quá lớn, Khoa_nhom vs số ngày │
 │  • Post-run KPI: slot util, peak load, PBL pos      │
 └─────────────────┬───────────────────────────────────┘
                   │
 ┌─────────────────▼───────────────────────────────────┐
-│ engine/heuristic.py — DSATUR greedy                 │
-│  • Sort theo (priority, degree, size)               │
-│  • Score slot = PBL + balance + prep + repair       │
+│ engine/heuristic.py — Greedy + LNS                  │
+│  • Thứ tự ca: khóa (2 số đầu của 4 cuối MalopHP) giảm dần → priority → bậc → size │
+│  • Score slot = PBL + balance + prep (nhẹ hơn với khóa cũ) + repair │
+│  • Khoa_nhom cứng (trừ ca tách cùng học phần)       │
 │  • Soft cap nearly-hard (bậc 1.5 + base 10k)        │
-│  • Cascade-relax tự động khi unplaced               │
-│  • lns_improve(): move-based LS,                    │
-│    chấm điểm = prep_vio + peak_overflow             │
+│  • Cascade-relax khi unplaced (Khoa_nhom vẫn cứng)  │
+│  • lns_improve(): move-based LS (+ Khoa_nhom)       │
 └─────────────────┬───────────────────────────────────┘
                   │ assignment + warm-start
 ┌─────────────────▼───────────────────────────────────┐
 │ engine/scheduler.py — CP-SAT polish                 │
 │  • Bỏ slot×exam reification (đẩy về phase phòng)    │
 │  • max_exams_per_day = AddCumulative per-student    │
+│  • Khoa_nhom: day_i ≠ day_j cho cặp môn khác học phần │
 │  • Top-K prep pairs cho soft penalty                │
 │  • Skip auto khi instance > 500k cặp môn×slot       │
 └─────────────────┬───────────────────────────────────┘
                   │ final scheduled
 ┌─────────────────▼───────────────────────────────────┐
 │ engine/rooms.py                                     │
+│  • Gom phòng cùng khu = cùng ký tự đầu RoomID      │
 │  • FFD bin-packing theo phòng to nhất               │
 │  • Cân bằng tải giám thị theo (ngày, total)         │
 └─────────────────────────────────────────────────────┘
@@ -314,10 +382,11 @@ Cuối trang có nút **⬇️ Tải xuống `ket_qua_xep_lich_thi.xlsx`** với
 
 **Ràng buộc cứng**
 1. `slot_i ≠ slot_j` cho mọi cặp `(i,j)` có SV trùng.
-2. `AddCumulative([intervals_for_student_s], [1,1,…], capacity=max_per_day)` mỗi SV.
-3. `|day_i − day_j| ≥ ⌈min_prep_days⌉` nếu `min_prep_days > 0`.
-4. Domain `slot_i` lọc theo `exam_type` (lý thuyết / vấn đáp / máy tính).
-5. `slot_i = target` cho `fixed_slots` (đổi lịch thủ công).
+2. `AddCumulative([intervals_for_student_s], [1,1,…], capacity=max_per_day)` mỗi SV (khi SV đó có nhiều hơn `max_per_day` môn).
+3. `|day_i − day_j| ≥ ⌈min_prep_days⌉` nếu `min_prep_days > 0` (trên các cặp xung đột SV).
+4. **Khoa_nhom**: nếu hai ca có giao **4 ký tự cuối MalopHP** và là **hai học phần khác nhau** (không thuộc miễn ca tách) thì `day_i ≠ day_j`.
+5. Domain `slot_i` lọc theo `exam_type` và quy tắc thứ trong tuần (môn đông → T7–CN, v.v.).
+6. `slot_i = target` cho `fixed_slots` (đổi lịch thủ công).
 
 **Hàm mục tiêu (mềm)**
 ```
@@ -343,9 +412,11 @@ Mỗi vòng (`iteration`):
 2. Bỏ `max_exams_per_day`.
 3. Cho phép xung đột SV tối thiểu (last resort, log lại).
 
+**Khoa_nhom** và **xung đột slot (SV trùng)** ở các bước trước vẫn được giữ cứng; chỉ bước (3) mới cho phép trùng SV tối thiểu.
+
 ---
 
-## 8. Benchmark thực tế
+## 9. Benchmark thực tế
 
 Dataset: `DSSV_2510_xep_lich_thi.xlsx` — 112,961 đăng ký, 16,487 SV, 1,055 môn, 56 ngày, 12 ca/ngày.
 
@@ -363,7 +434,7 @@ Dataset: `DSSV_2510_xep_lich_thi.xlsx` — 112,961 đăng ký, 16,487 SV, 1,055 
 
 ---
 
-## 9. Cấu trúc thư mục
+## 10. Cấu trúc thư mục
 
 ```
 ExamScheduling/
@@ -386,7 +457,7 @@ ExamScheduling/
 
 ---
 
-## 10. Hướng nâng cấp tiếp
+## 11. Hướng nâng cấp tiếp
 
 - **Lịch ràng buộc giảng viên**: 1 giảng viên không bị 2 ca chấm cùng lúc.
 - **Phân ca theo phòng cụ thể** (room-aware slot constraint) khi danh sách phòng nhỏ.

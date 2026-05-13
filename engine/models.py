@@ -12,6 +12,8 @@ class Registration:
     section_id: str
     course_name: str
     credits: float
+    # Theo bảng mã: 1=Tự luận, 2=Trắc nghiệm, 3=Vấn đáp — None = suy từ tên môn
+    exam_format: int | None = None
 
 
 @dataclass
@@ -19,12 +21,14 @@ class Exam:
     exam_id: str
     course_id: str
     course_name: str
-    exam_type: str  # "theory" | "oral" | "computer"
+    exam_type: str  # "theory" | "oral" | "computer" — đồng bộ với exam_format
     section_ids: List[str]
     credits: float
     student_ids: List[str]
-    priority: int = 0           # >0: ưu tiên xếp cuối đợt (PBL/đồ án)
-    prep_days: float = 0.0      # số ngày ôn khuyến nghị
+    exam_format: int = 1  # 1=Tự luận, 2=Trắc nghiệm, 3=Vấn đáp (đồng bộ phân phòng)
+    course_prefix_7: str = ""  # 7 ký tự trái MalopHP — cùng mã nhiều ca → cùng buổi
+    priority: int = 0  # >0: ưu tiên xếp cuối đợt (PBL/đồ án)
+    prep_days: float = 0.0  # số ngày ôn khuyến nghị
 
     @property
     def size(self) -> int:
@@ -82,6 +86,8 @@ class PrepViolation:
     later_exam: str
     required_days: float
     actual_days: float
+    # Môn thi sau (cần khoảng ôn) — dùng để gom theo 7 ký tự đầu MalopHP
+    later_exam_id: str = ""
 
 
 @dataclass

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import asdict
 from io import BytesIO
 from typing import Dict, List
 
@@ -8,6 +7,14 @@ import pandas as pd
 
 from .i18n import hien_thi_loai_hinh
 from .models import Exam, PrepViolation, ScheduledExam
+
+
+def _exam_malophp_cell(exam: Exam | None) -> str:
+    """Chuỗi MalopHP xuất Excel — giữ nguyên mã lớp học phần từ đăng ký (có thể nhiều lớp, cách nhau bởi dấu phẩy)."""
+    if exam is None:
+        return ""
+    parts = [str(s).strip() for s in exam.section_ids if str(s).strip()]
+    return ", ".join(sorted(parts)) if parts else ""
 
 
 def schedule_to_dataframe(
@@ -19,12 +26,20 @@ def schedule_to_dataframe(
     for s in scheduled:
         ex = exam_map.get(s.exam_id)
         tin_chi = float(ex.credits) if ex else None
+        fmt = int(getattr(ex, "exam_format", 1) or 1) if ex else None
+        pfx7 = str(getattr(ex, "course_prefix_7", "") or "") if ex else ""
+        pri = int(ex.priority) if ex else None
+        malop = _exam_malophp_cell(ex)
         rows.append(
             {
                 "Ma_ca_thi": s.exam_id,
+                "MalopHP": malop,
                 "Ma_hoc_phan": s.course_id,
                 "Ten_mon": s.course_name,
                 "So_tin_chi": tin_chi,
+                "Thu_tu_uu_tien": pri,
+                "Ma_khoa_hoc_phan_7": pfx7,
+                "Ma_hinh_thuc": fmt,
                 "Ngay_thi": s.exam_date.isoformat(),
                 "So_ca": s.session,
                 "Ky_hieu_ca": getattr(s, "session_label", ""),
@@ -44,6 +59,7 @@ def violations_to_dataframe(violations: List[PrepViolation]) -> pd.DataFrame:
                 "Ten_sinh_vien": v.student_name,
                 "Mon_thi_truoc": v.earlier_exam,
                 "Mon_thi_sau": v.later_exam,
+                "Ma_ca_thi_sau": getattr(v, "later_exam_id", "") or "",
                 "So_ngay_on_yeu_cau": v.required_days,
                 "So_ngay_on_thuc_te": v.actual_days,
             }
@@ -69,9 +85,13 @@ def student_view_dataframe(
                     "Ma_sinh_vien": sid,
                     "Ten_sinh_vien": student_name_map.get(sid, ""),
                     "Ma_ca_thi": item.exam_id,
+                    "MalopHP": _exam_malophp_cell(exam),
                     "Ma_hoc_phan": exam.course_id,
                     "Ten_mon": exam.course_name,
                     "So_tin_chi": float(exam.credits),
+                    "Thu_tu_uu_tien": int(exam.priority),
+                    "Ma_khoa_hoc_phan_7": str(getattr(exam, "course_prefix_7", "") or ""),
+                    "Ma_hinh_thuc": int(getattr(exam, "exam_format", 1) or 1),
                     "Loai_hinh_thi": hien_thi_loai_hinh(exam.exam_type),
                     "Ngay_thi": item.exam_date.isoformat(),
                     "So_ca": item.session,
@@ -95,9 +115,13 @@ def exam_view_dataframe(scheduled: List[ScheduledExam], exams: List[Exam]) -> pd
         rows.append(
             {
                 "Ma_ca_thi": item.exam_id,
+                "MalopHP": _exam_malophp_cell(exam),
                 "Ma_hoc_phan": item.course_id,
                 "Ten_mon": item.course_name,
                 "So_tin_chi": float(exam.credits),
+                "Thu_tu_uu_tien": int(exam.priority),
+                "Ma_khoa_hoc_phan_7": str(getattr(exam, "course_prefix_7", "") or ""),
+                "Ma_hinh_thuc": int(getattr(exam, "exam_format", 1) or 1),
                 "Loai_hinh_thi": hien_thi_loai_hinh(exam.exam_type),
                 "Ngay_thi": item.exam_date.isoformat(),
                 "So_ca": item.session,

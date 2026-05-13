@@ -54,6 +54,11 @@ def _parse_csv(text: str) -> List[str]:
 
 
 def _build_slot_config(theory: str, oral: str, computer: str):
+    """Trả về (session_labels, allowed_by_type, session_half).
+
+    `session_half[i]` ∈ {0,1}: 0 = buổi sáng, 1 = buổi chiều — theo thứ tự ca trong
+    từng nhóm loại: nửa đầu danh sách ca của loại đó là sáng, nửa sau là chiều.
+    """
     by_type_labels = {
         "theory": _parse_csv(theory),
         "oral": _parse_csv(oral),
@@ -61,6 +66,13 @@ def _build_slot_config(theory: str, oral: str, computer: str):
     }
     if any(len(v) == 0 for v in by_type_labels.values()):
         raise ValueError("Mỗi nhóm ca thi (lý thuyết / PBL / trắc nghiệm máy) phải có ≥ 1 ca.")
+    label_half: Dict[str, int] = {}
+    for labels in by_type_labels.values():
+        n = len(labels)
+        mid = (n + 1) // 2
+        for i, lbl in enumerate(labels):
+            if lbl not in label_half:
+                label_half[lbl] = 0 if i < mid else 1
     all_labels: List[str] = []
     for labels in by_type_labels.values():
         for lbl in labels:
@@ -69,7 +81,8 @@ def _build_slot_config(theory: str, oral: str, computer: str):
     allowed_by_type: Dict[str, List[int]] = {}
     for etype, labels in by_type_labels.items():
         allowed_by_type[etype] = [all_labels.index(l) for l in labels]
-    return all_labels, allowed_by_type
+    session_half = [label_half[lbl] for lbl in all_labels]
+    return all_labels, allowed_by_type, session_half
 
 
 def _run_pipeline(
@@ -78,6 +91,7 @@ def _run_pipeline(
     rooms,
     invigilators,
     session_labels,
+    session_half,
     allowed_sessions_by_exam_id,
     allowed_sessions_by_type,
     student_name_map,
@@ -93,6 +107,12 @@ def _run_pipeline(
     fixed_slots=None,
     base_slots=None,
     auto_relax=True,
+    theory_fill_low=0.90,
+    theory_fill_high=1.00,
+    computer_fill_low=0.85,
+    computer_fill_high=0.95,
+    weekend_large_course_min_students=0,
+    spread_prep_factor=1.0,
 ):
     """Một bước: chẩn đoán → solve → phân phòng → vi phạm → KPI."""
     started = time.time()
@@ -109,6 +129,7 @@ def _run_pipeline(
         allowed_sessions_by_type=allowed_sessions_by_type,
         min_prep_days=float(min_prep_days),
         max_exams_per_day=int(max_exams_per_day),
+        weekend_large_course_min_students=int(weekend_large_course_min_students),
     )
 
     result = solve(
@@ -117,6 +138,7 @@ def _run_pipeline(
         rooms=rooms,
         allowed_sessions_by_exam_id=allowed_sessions_by_exam_id,
         session_labels=session_labels,
+        session_half=list(session_half or []),
         prep_day_per_credit=float(prep_day_per_credit),
         min_prep_days=float(min_prep_days),
         max_exams_per_day=int(max_exams_per_day),
@@ -129,6 +151,8 @@ def _run_pipeline(
         soft_slot_cap=int(soft_slot_cap) if soft_slot_cap and int(soft_slot_cap) > 0 else None,
         lns_iterations=int(lns_iterations),
         progress_cb=_cb,
+        weekend_large_course_min_students=int(weekend_large_course_min_students),
+        spread_prep_factor=float(spread_prep_factor),
     )
 
     room_report = assign_rooms_and_invigilators(
@@ -137,6 +161,10 @@ def _run_pipeline(
         rooms=rooms,
         invigilators=invigilators,
         invigilators_per_room=int(invigilators_per_room),
+        theory_fill_low=float(theory_fill_low),
+        theory_fill_high=float(theory_fill_high),
+        computer_fill_low=float(computer_fill_low),
+        computer_fill_high=float(computer_fill_high),
     )
 
     violations = detect_prep_violations(
@@ -164,8 +192,8 @@ def _run_pipeline(
 
 st.title("📅 Hệ thống xếp lịch thi tín chỉ")
 st.caption(
-    "Kết hợp thuật toán tham lam (DSATUR) và tối ưu ràng buộc (SAT): luôn có lịch khả thi, "
-    "ưu tiên ngày ôn và xếp môn PBL/đồ án về cuối đợt."
+    "Thứ trong tuần: môn thường ưu tiên thứ Hai–thứ Bảy; môn đông (≥ ngưỡng SV theo 7 ký tự MalopHP) "
+    "chỉ thứ Bảy/Chủ nhật. Kết hợp tham lam (DSATUR), LNS và SAT khi đủ nhỏ."
 )
 
 with st.sidebar:
@@ -177,17 +205,38 @@ with st.sidebar:
             help="Ví dụ 0.6 ngày × 3 TC = ~2 ngày ôn cho môn 3 TC.",
         )
         min_prep_days = st.number_input(
-            "Số ngày ôn tối thiểu (cứng)", min_value=0.0, value=0.0, step=0.5,
-            help="0 = không ép cứng. Lớn hơn 0 = bắt buộc khoảng cách tối thiểu (ngày) giữa hai môn có chung sinh viên.",
+            "Số ngày ôn tối thiểu (cứng)", min_value=0.0, value=1.0, step=0.5,
+            help="0 = không ép cứng. Mặc định 1 = mỗi môn ít nhất 1 ngày ôn (theo tín chỉ và ngưỡng này).",
         )
         max_exams_per_day = st.number_input(
             "Tối đa môn / sinh viên / ngày", min_value=1, value=2, step=1,
+        )
+        weekend_large_min_sv = st.number_input(
+            "Ngưỡng SV (7 ký tự MalopHP) → môn đông chỉ thi thứ Bảy hoặc Chủ nhật",
+            min_value=0,
+            value=800,
+            step=50,
+            help=(
+                "0 = tắt. Tổng SV duy nhất theo 7 ký tự đầu mã lớp học phần: nếu ≥ ngưỡng thì "
+                "chỉ xếp thứ Bảy/Chủ nhật. Dưới ngưỡng: chỉ thứ Hai–thứ Bảy (không Chủ nhật)."
+            ),
+        )
+        spread_prep_factor = st.slider(
+            "Độ ưu tiên giãn ngày ôn (scoring tham lam)",
+            min_value=1.0,
+            max_value=3.0,
+            value=1.75,
+            step=0.05,
+            help="Tăng để thuật toán phạt mạnh hơn khi khoảng cách ôn giữa các môn quá hẹp (soft).",
         )
 
     with st.expander("Bộ ca thi theo loại", expanded=True):
         theory_text = st.text_input(
             "Ca lý thuyết (cách nhau bằng dấu phẩy)", value="2C1,2C2,2C3,2C4",
-            help="Danh sách ký hiệu ca cho môn lý thuyết, ví dụ 2C1 là ca 1 buổi 2.",
+            help=(
+                "Ký hiệu ca theo thứ tự thời gian. Nửa đầu danh sách = buổi sáng, nửa sau = chiều "
+                "(dùng chung cho ràng buộc cùng buổi theo 7 ký tự đầu MalopHP)."
+            ),
         )
         oral_text = st.text_input(
             "Ca PBL / đồ án / vấn đáp (cách nhau bằng dấu phẩy)", value="1A1,1P1",
@@ -198,8 +247,8 @@ with st.sidebar:
 
     with st.expander("Bộ giải và tối ưu", expanded=False):
         solver_time_limit = st.number_input(
-            "Thời gian tối đa (giây)", min_value=10, value=120, step=10,
-            help="Giới hạn thời gian cho bước tối ưu SAT. Bước tham lam thường dưới 30 giây.",
+            "Thời gian tối đa (giây)", min_value=10, value=600, step=10,
+            help="Giới hạn thời gian cho bước tối ưu SAT. Bước tham lam thường dưới vài phút.",
         )
         optimize_objective = st.checkbox(
             "Bật tối ưu (LNS + bước SAT)", value=True,
@@ -224,8 +273,8 @@ with st.sidebar:
             min_value=200, max_value=10000, value=1500, step=100,
             disabled=not enable_split,
             help=(
-                "Môn vượt ngưỡng sẽ tự chia thành nhiều ca thi khác nhau "
-                "(mỗi ca một đề, phân theo lớp học phần). "
+                "Trần cứng: mỗi ca thi không quá số SV này (nhân sự giám thị / vận hành). "
+                "Môn vượt ngưỡng tách nhiều ca (đề riêng), kể cả khi một lớp học phần quá đông. "
                 "1500 là mặc định cân đối; giảm nếu ít phòng."
             ),
         )
@@ -277,6 +326,25 @@ with st.sidebar:
         invigilators_per_room = st.number_input(
             "Giám thị / phòng", min_value=1, value=2, step=1,
         )
+        st.caption(
+            "Mã hình thức thi: 1=Tự luận (phòng lý thuyết, lấp đầy 90–100%), "
+            "2=Trắc nghiệm (phòng máy, 85–95%), 3=Vấn đáp (không gò theo SV)."
+        )
+        c_lo, c_hi = st.columns(2)
+        with c_lo:
+            theory_fill_low = st.number_input(
+                "Lý thuyết — tỉ lệ tối thiểu", min_value=0.5, max_value=1.0, value=0.90, step=0.01,
+            )
+            computer_fill_low = st.number_input(
+                "Máy — tỉ lệ tối thiểu", min_value=0.5, max_value=1.0, value=0.85, step=0.01,
+            )
+        with c_hi:
+            theory_fill_high = st.number_input(
+                "Lý thuyết — tỉ lệ tối đa", min_value=0.5, max_value=1.0, value=1.00, step=0.01,
+            )
+            computer_fill_high = st.number_input(
+                "Máy — tỉ lệ tối đa", min_value=0.5, max_value=1.0, value=0.95, step=0.01,
+            )
 
 # ---------------------------------------------------------------------------
 # Upload + Run
@@ -292,13 +360,19 @@ with up_col1:
     reg_file = st.file_uploader(
         "2) Danh sách SV đăng ký môn (DSSV_*.xlsx) — bắt buộc",
         type=["xlsx"],
-        help="Cột bắt buộc: MaHS, TenSV, MalopHP, TenLopHP, SoTC.",
+        help="Cột: MaHS, TenSV, MalopHP, TenLopHP, SoTC. Tuỳ chọn MaHinhThuc theo bảng mã: 1=Tự luận, 2=Trắc nghiệm, 3=Vấn đáp (nếu trống: suy từ tên môn). "
+        "Ràng buộc lịch: 4 ký tự cuối MalopHP = Khoa_nhom — hai môn khác nhau cùng hậu tố không thi cùng một ngày.",
     )
 with up_col2:
     rooms_file = st.file_uploader(
         "3) Phòng thi (tuỳ chọn)",
         type=["xlsx"],
-        help="Cột trong Excel: RoomID (mã phòng), Location (vị trí), Capacity (sức chứa).",
+        help=(
+            "Mã phòng (RoomID / Phòng…), sức chứa (Capacity / So luong…). "
+            "Tuỳ chọn: khu (Khu / Location); cột mã ghép phòng (RoomType / «Mã ghép hình thức thi») "
+            "dùng cùng bảng với môn thi: 1=Tự luận→ưu tiên phòng lý thuyết, 2=Trắc nghiệm→phòng máy, "
+            "3=Vấn đáp→mọi phòng phù hợp."
+        ),
     )
     invigilators_file = st.file_uploader(
         "4) Giám thị (tuỳ chọn)",
@@ -325,7 +399,9 @@ if run_btn:
             inv_path = _save_uploaded(invigilators_file) if invigilators_file else None
 
             window = load_schedule_window(plan_path)
-            session_labels, allowed_by_type = _build_slot_config(theory_text, oral_text, computer_text)
+            session_labels, allowed_by_type, session_half = _build_slot_config(
+                theory_text, oral_text, computer_text
+            )
             window.sessions_per_day = len(session_labels)
 
             registrations = load_registrations(reg_path)
@@ -352,6 +428,7 @@ if run_btn:
             rooms=rooms,
             invigilators=invigilators,
             session_labels=session_labels,
+            session_half=session_half,
             allowed_sessions_by_exam_id=allowed_by_exam,
             allowed_sessions_by_type=allowed_by_type,
             student_name_map=student_name_map,
@@ -365,11 +442,18 @@ if run_btn:
             soft_slot_cap=effective_cap,
             lns_iterations=lns_iterations,
             auto_relax=auto_relax_on_infeasible,
+            theory_fill_low=theory_fill_low,
+            theory_fill_high=theory_fill_high,
+            computer_fill_low=computer_fill_low,
+            computer_fill_high=computer_fill_high,
+            weekend_large_course_min_students=int(weekend_large_min_sv),
+            spread_prep_factor=float(spread_prep_factor),
         )
 
         st.session_state["scheduler_data"] = {
             "window": window,
             "session_labels": session_labels,
+            "session_half": session_half,
             "allowed_by_type": allowed_by_type,
             "allowed_by_exam": allowed_by_exam,
             "registrations": registrations,
@@ -391,6 +475,13 @@ if run_btn:
                 "lns_iterations": int(lns_iterations),
                 "enable_split": bool(enable_split),
                 "max_exam_size": int(max_exam_size) if enable_split else None,
+                "theory_fill_low": float(theory_fill_low),
+                "theory_fill_high": float(theory_fill_high),
+                "computer_fill_low": float(computer_fill_low),
+                "computer_fill_high": float(computer_fill_high),
+                "session_half": list(session_half),
+                "weekend_large_course_min_students": int(weekend_large_min_sv),
+                "spread_prep_factor": float(spread_prep_factor),
             },
         }
         st.success(
@@ -442,6 +533,14 @@ with tabs[0]:
     c3.metric("Ô thời gian đã dùng / tổng", f"{kpi.slots_used} / {result.stats.num_slots}")
     c4.metric("Vi phạm ngày ôn", f"{kpi.prep_violation_count:,}")
 
+    hard_errs = getattr(kpi, "prep_prefix_hard_errors", None) or []
+    if hard_errs:
+        st.error(
+            "**Lỗi cứng (học phần — 7 ký tự đầu MalopHP):** quá 10% sinh viên của học phần "
+            "không có thời gian ôn trước môn thi (yêu cầu > 0 ngày, thực tế ≤ 0).\n\n"
+            + "\n".join(f"- {msg}" for msg in hard_errs)
+        )
+
     c5, c6, c7, c8 = st.columns(4)
     c5.metric("Phương thức giải", hien_thi_phuong_thuc(result.stats.method))
     c6.metric("Thời gian giải", f"{result.stats.elapsed_seconds:.1f} giây")
@@ -480,6 +579,12 @@ with tabs[1]:
 
     if diagnose_report.errors:
         st.error("**Vấn đề cứng:**\n\n" + "\n".join(f"- {e}" for e in diagnose_report.errors))
+    hard_errs = getattr(kpi, "prep_prefix_hard_errors", None) or []
+    if hard_errs:
+        st.error(
+            "**Lỗi cứng sau xếp lịch (ngày ôn / học phần 7 ký tự):**\n\n"
+            + "\n".join(f"- {msg}" for msg in hard_errs)
+        )
     if diagnose_report.warnings:
         st.warning("**Cảnh báo:**\n\n" + "\n".join(f"- {w}" for w in diagnose_report.warnings))
     if diagnose_report.info:
@@ -648,12 +753,14 @@ with tabs[5]:
                     base_slots[item.exam_id] = d_off * window.sessions_per_day + (item.session - 1)
                 fixed_slots = {selected_eid: target_slot}
                 cfg = state["config"]
+                sh = state.get("session_half") or cfg.get("session_half") or [0] * len(session_labels)
                 new_outcome = _run_pipeline(
                     exams=exams,
                     window=window,
                     rooms=state["rooms"],
                     invigilators=state["invigilators"],
                     session_labels=session_labels,
+                    session_half=sh,
                     allowed_sessions_by_exam_id=state["allowed_by_exam"],
                     allowed_sessions_by_type=state["allowed_by_type"],
                     student_name_map=student_name_map,
@@ -669,6 +776,14 @@ with tabs[5]:
                     auto_relax=cfg["auto_relax"],
                     fixed_slots=fixed_slots,
                     base_slots=base_slots,
+                    theory_fill_low=cfg.get("theory_fill_low", 0.90),
+                    theory_fill_high=cfg.get("theory_fill_high", 1.00),
+                    computer_fill_low=cfg.get("computer_fill_low", 0.85),
+                    computer_fill_high=cfg.get("computer_fill_high", 0.95),
+                    weekend_large_course_min_students=int(
+                        cfg.get("weekend_large_course_min_students", 0)
+                    ),
+                    spread_prep_factor=float(cfg.get("spread_prep_factor", 1.0)),
                 )
                 state["outcome"] = new_outcome
                 st.session_state["scheduler_data"] = state
@@ -697,6 +812,9 @@ kpi_rows = [
     ("Trung bình SV / ca", round(kpi.avg_students_per_slot, 1)),
     ("Cao nhất SV / ca", kpi.max_students_per_slot),
 ]
+for msg in getattr(kpi, "prep_prefix_hard_errors", None) or []:
+    kpi_rows.append(("Lỗi cứng học phần (>10% SV không ôn)", msg))
+
 excel_bytes = to_excel_bytes(schedule_df, vios_df, student_df, kpi_rows)
 st.download_button(
     "⬇️ Tải file kết quả (Excel)",

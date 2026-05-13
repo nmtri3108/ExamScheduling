@@ -1,22 +1,150 @@
-"""Phân phòng & giám thị sau khi đã xếp lịch slot (day/session).
+"""Phân phòng & giám thị sau khi đã có lịch slot (ngày + ca).
 
-Tách module riêng để dễ thay đổi quy tắc bin-packing trong tương lai (FFD, BFD, hoặc CP).
-Triết lý: ưu tiên phòng to cho môn đông, cân bằng tải giám thị theo ngày.
+Mã hình thức thi (Ma_hinh_thuc) — khớp bảng quy định / cột «Mã» trong kế hoạch:
+- 1 — Tự luận → ưu tiên phòng loại lý thuyết (theory); độ lấp đầy mục tiêu 90%–100%.
+- 2 — Trắc nghiệm → ưu tiên phòng máy (computer); độ lấp đầy 85%–95%.
+- 3 — Vấn đáp → không gò sức chứa theo số SV; gán tối thiểu một phòng phù hợp.
+
+File phòng (cột «Mã ghép hình thức thi» hoặc RoomType) dùng cùng bộ mã 1/2/3 để gợi ý
+loại phòng tương ứng; có thể dùng thêm chữ theory / computer / any.
+
+File phòng: khi một môn cần nhiều phòng, ưu tiên gom phòng **cùng khu** — khu = **ký tự đầu**
+của mã phòng (RoomID), ví dụ B101 và B205 cùng khu «B».
 """
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, List, Set, Tuple
 
 from .models import Exam, Invigilator, Room, ScheduledExam
 
 
+_THEORY_TYPES = frozenset(
+    {"theory", "ly_thuyet", "ly_thuyết", "classroom", "phong_ly_thuyet", "phòng_lý_thuyết", "any", ""}
+)
+_COMP_TYPES = frozenset(
+    {"computer", "may_tinh", "máy_tính", "lab", "phong_may", "phòng_máy", "any", ""}
+)
+
+
+def _norm_room_type(rt: str) -> str:
+    return str(rt or "any").strip().lower()
+
+
+def _eligible_rooms(fmt: int, pool: List[Room]) -> List[Room]:
+    if not pool:
+        return []
+    if fmt == 2:
+        out = [r for r in pool if _norm_room_type(r.room_type) in _COMP_TYPES]
+        return out or list(pool)
+    if fmt == 1:
+        out = [r for r in pool if _norm_room_type(r.room_type) in _THEORY_TYPES]
+        return out or list(pool)
+    return list(pool)
+
+
+def _capacity_target_range(need: int, util_low: float, util_high: float) -> Tuple[int, int]:
+    """Tổng chỗ ngồi mong muốn sao cho need/sum ∈ [util_low, util_high]."""
+    if need <= 0:
+        return 0, 0
+    lo = int(math.ceil(need / util_high))
+    hi = int(math.floor(need / util_low + 1e-9)) if util_low > 1e-9 else need * 3
+    hi = max(hi, lo)
+    return lo, hi
+
+
+def _pick_rooms_utilization(
+    need: int,
+    pool: List[Room],
+    util_low: float,
+    util_high: float,
+) -> List[Room]:
+    """FFD: ưu tiên phòng lớn trước, đạt tổng capacity trong [lo, hi] nếu có thể, luôn ≥ need."""
+    if need <= 0 or not pool:
+        return []
+    lo, hi = _capacity_target_range(need, util_low, util_high)
+    ordered = sorted(pool, key=lambda r: -r.capacity)
+    chosen: List[Room] = []
+    total = 0
+    for r in ordered:
+        chosen.append(r)
+        total += r.capacity
+        if total >= need and total >= lo:
+            if total <= hi or total >= need * 1.2:
+                break
+    while total < need:
+        for r in ordered:
+            if r in chosen:
+                continue
+            chosen.append(r)
+            total += r.capacity
+            if total >= need:
+                break
+        else:
+            break
+    return chosen
+
+
+def _zone_key(room: Room) -> str:
+    """Khu = ký tự đầu tiên của mã phòng (RoomID), thống nhất khi gom nhiều phòng."""
+    rid = str(room.room_id or "").strip()
+    if not rid:
+        return "_"
+    return rid[0].upper()
+
+
+def _pick_rooms_utilization_prefer_same_zone(
+    need: int,
+    pool: List[Room],
+    util_low: float,
+    util_high: float,
+) -> List[Room]:
+    """Giống FFD utilization nhưng ưu tiên tất cả phòng lấy từ cùng một khu nếu đủ sức chứa."""
+    if need <= 0 or not pool:
+        return []
+    by_zone: Dict[str, List[Room]] = defaultdict(list)
+    for r in pool:
+        by_zone[_zone_key(r)].append(r)
+    best: List[Room] | None = None
+    best_score: Tuple[int, int, int] | None = None  # (num_rooms, -zone_cap, -picked_seats)
+    for _zk, rs in by_zone.items():
+        cap = sum(r.capacity for r in rs)
+        if cap < need:
+            continue
+        picked = _pick_rooms_utilization(need, rs, util_low, util_high)
+        seats = sum(r.capacity for r in picked)
+        if seats < need:
+            continue
+        n_rooms = len(picked)
+        score = (n_rooms, -cap, -seats)
+        if best_score is None or score < best_score:
+            best = picked
+            best_score = score
+    if best is not None:
+        return best
+    return _pick_rooms_utilization(need, pool, util_low, util_high)
+
+
+def _pick_rooms_oral(pool: List[Room], need: int) -> List[Room]:
+    """Vấn đáp: không tối ưu theo số SV — một phòng đủ lớn hoặc phòng nhỏ nhất có thể."""
+    if not pool:
+        return []
+    if need <= 0:
+        return [min(pool, key=lambda r: r.capacity)]
+    asc = sorted(pool, key=lambda r: r.capacity)
+    for r in asc:
+        if r.capacity >= need:
+            return [r]
+    return [max(pool, key=lambda r: r.capacity)]
+
+
 @dataclass
 class RoomAssignmentReport:
-    overflows: List[str] = field(default_factory=list)         # mô tả slot/môn thiếu phòng
+    overflows: List[str] = field(default_factory=list)
     invigilator_shortage: List[str] = field(default_factory=list)
-    room_usage: Dict[str, int] = field(default_factory=dict)   # room_id -> số ca dùng
+    room_usage: Dict[str, int] = field(default_factory=dict)
     invigilator_usage: Dict[str, int] = field(default_factory=dict)
 
 
@@ -26,8 +154,12 @@ def assign_rooms_and_invigilators(
     rooms: List[Room],
     invigilators: List[Invigilator],
     invigilators_per_room: int = 2,
+    theory_fill_low: float = 0.90,
+    theory_fill_high: float = 1.00,
+    computer_fill_low: float = 0.85,
+    computer_fill_high: float = 0.95,
 ) -> RoomAssignmentReport:
-    """Phân phòng & giám thị in-place vào `scheduled`. Trả về báo cáo lỗi/quá tải."""
+    """Phân phòng & giám thị in-place vào `scheduled`."""
     report = RoomAssignmentReport()
     exam_map = {e.exam_id: e for e in exams}
     if not rooms:
@@ -42,7 +174,7 @@ def assign_rooms_and_invigilators(
         by_slot[(s.exam_date.isoformat(), s.session)].append(s)
 
     for (slot_day, slot_session), exam_list in by_slot.items():
-        used_rooms: set[str] = set()
+        used_ids: Set[str] = set()
         for sched_exam in sorted(
             exam_list,
             key=lambda x: exam_map[x.exam_id].size if x.exam_id in exam_map else 0,
@@ -52,31 +184,37 @@ def assign_rooms_and_invigilators(
             if exam is None:
                 continue
             need = exam.size
-            assigned: List[Room] = []
-            seats = 0
-            for room in room_pool:
-                if room.room_id in used_rooms:
-                    continue
-                assigned.append(room)
-                used_rooms.add(room.room_id)
-                seats += room.capacity
-                if seats >= need:
-                    break
-            if seats < need:
+            fmt = int(getattr(exam, "exam_format", 1) or 1)
+            eligible = [r for r in room_pool if r.room_id not in used_ids]
+            eligible = _eligible_rooms(fmt, eligible)
+
+            if fmt == 3:
+                assigned = _pick_rooms_oral(eligible, need)
+            elif fmt == 2:
+                assigned = _pick_rooms_utilization_prefer_same_zone(
+                    need, eligible, computer_fill_low, computer_fill_high
+                )
+            else:
+                assigned = _pick_rooms_utilization_prefer_same_zone(
+                    need, eligible, theory_fill_low, theory_fill_high
+                )
+
+            seats = sum(r.capacity for r in assigned)
+            if fmt != 3 and seats < need:
                 report.overflows.append(
                     f"Thiếu phòng cho '{exam.course_name}' ngày {slot_day} ca {slot_session} "
-                    f"(cần {need}, có {seats})."
+                    f"(cần chỗ cho {need} SV, tổng sức chứa {seats})."
                 )
-                # vẫn ghi lại các phòng đã chiếm để có dấu vết
+            for r in assigned:
+                used_ids.add(r.room_id)
             sched_exam.room_ids = [r.room_id for r in assigned]
             for r in assigned:
                 report.room_usage[r.room_id] = report.room_usage.get(r.room_id, 0) + 1
 
-            # Giám thị
             if not invigilators:
                 sched_exam.invigilator_ids = []
                 continue
-            needed = max(1, len(assigned)) * invigilators_per_room
+            needed = max(1, len(assigned)) * int(invigilators_per_room)
             candidates = sorted(
                 invigilators,
                 key=lambda i: (

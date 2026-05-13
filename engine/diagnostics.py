@@ -6,6 +6,7 @@ Mục tiêu:
 """
 from __future__ import annotations
 
+from datetime import timedelta
 from collections import defaultdict
 from dataclasses import dataclass, field
 from math import ceil
@@ -64,6 +65,7 @@ def diagnose(
     allowed_sessions_by_type: Dict[str, List[int]] | None = None,
     min_prep_days: float = 0.0,
     max_exams_per_day: int = 2,
+    weekend_large_course_min_students: int = 0,
 ) -> FeasibilityReport:
     report = FeasibilityReport()
     if not exams:
@@ -161,6 +163,46 @@ def diagnose(
             "Bài toán quy mô lớn: hệ thống sẽ dùng thuật toán tham lam (DSATUR) trước, "
             "sau đó mới tối ưu ràng buộc (SAT) nếu kích thước cho phép."
         )
+
+    # Ngày trong tuần: môn đông → chỉ T7/CN; môn thường → T2–T7 (không CN)
+    if weekend_large_course_min_students > 0 and report.num_exams:
+        totals = build_prefix_student_totals(exams)
+        sat_sun_days = 0
+        mon_sat_days = 0
+        for i in range(window.total_days):
+            wd = (window.start_date + timedelta(days=i)).weekday()
+            if wd in (5, 6):
+                sat_sun_days += 1
+            if wd != 6:
+                mon_sat_days += 1
+        if sat_sun_days == 0:
+            report.errors.append(
+                "Đã bật ép môn đông thi cuối tuần (T7–CN) nhưng khung thi không có ngày thứ Bảy hoặc Chủ nhật."
+            )
+        if mon_sat_days == 0:
+            report.errors.append(
+                "Khung thi chỉ toàn Chủ nhật: không thể áp dụng quy tắc «môn thường thi thứ Hai–thứ Bảy»."
+            )
+        large_prefixes = [pfx for pfx, n in totals.items() if n >= weekend_large_course_min_students]
+        if large_prefixes and sat_sun_days > 0:
+            report.info.append(
+                f"Quy tắc ngày trong tuần: môn đông (≥{weekend_large_course_min_students} SV theo 7 ký tự MalopHP) "
+                f"chỉ xếp thứ Bảy/Chủ nhật; môn khác chỉ thứ Hai–thứ Bảy. "
+                f"Có {len(large_prefixes)} nhóm học phần đạt ngưỡng."
+            )
+
+    # Khoa_nhom (4 ký tự cuối MalopHP): mỗi ngày tối đa một ca thi cho mỗi hậu tố.
+    worst_k, worst_n = max_khoa_nhom_distinct_course_groups(exams)
+    if worst_n > report.num_days:
+        report.errors.append(
+            f"Khoa_nhom «{worst_k}» có {worst_n} môn (nhóm học phần) khác nhau cần xếp khác ngày, "
+            f"trong khi đợt chỉ có {report.num_days} ngày."
+        )
+    if worst_n > 0 or any(exam_khoa_nhom_keys(e) for e in exams):
+        report.info.append(
+            "Ràng buộc Khoa_nhom: 4 ký tự cuối MalopHP; hai môn khác nhau cùng hậu tố không cùng ngày "
+            "(các ca tách cùng học phần được miễn)."
+        )
     return report
 
 
@@ -179,6 +221,228 @@ class SchedulingKPI:
     prep_violation_students: int = 0
     pbl_position_score: float = 1.0   # 1.0 = tất cả PBL ở cuối đợt
     by_day_load: List[Tuple[str, int]] = field(default_factory=list)
+    # Điều kiện cứng: >10% SV / học phần (7 ký tự MalopHP) không có ngày ôn (thực tế ≤0)
+    prep_prefix_hard_errors: List[str] = field(default_factory=list)
+
+
+def _malop_prefix_7_for_exam(exam: Exam) -> str:
+    """Khóa nhóm học phần: 7 ký tự đầu MalopHP (hoặc từ section/course_id)."""
+    p = (exam.course_prefix_7 or "").strip()
+    if p:
+        return p[:7]
+    for sec in sorted(exam.section_ids):
+        s = str(sec).strip()
+        if len(s) >= 7:
+            return s[:7]
+    cid = (exam.course_id or "").strip()
+    return cid[:7] if len(cid) >= 7 else cid
+
+
+def khoa_nhom_from_malop(section_id: str) -> str:
+    """4 ký tự cuối MalopHP (Khoa_nhom): các ca có cùng hậu tố không được thi cùng một ngày."""
+    s = str(section_id or "").strip()
+    if not s:
+        return ""
+    return s[-4:] if len(s) >= 4 else s
+
+
+def cohort_index_from_malop(section_id: str) -> int:
+    """Hai ký tự đầu của 4 ký tự cuối MalopHP — mã khóa (vd 25, 22). Chỉ lấy nếu cả hai là chữ số."""
+    kn = khoa_nhom_from_malop(section_id)
+    if len(kn) < 2:
+        return 0
+    head = kn[:2]
+    return int(head) if head.isdigit() else 0
+
+
+def exam_khoa_nhom_keys(exam: Exam) -> frozenset[str]:
+    """Tập Khoa_nhom từ mọi MalopHP (section_id) của ca thi."""
+    keys: set[str] = set()
+    for sec in exam.section_ids:
+        k = khoa_nhom_from_malop(sec)
+        if k:
+            keys.add(k)
+    return frozenset(keys)
+
+
+def exam_max_cohort_index(exam: Exam) -> int:
+    """Khóa lớn nhất gắn với ca (max trên mọi MalopHP): khóa số lớn hơn → ưu tiên xếp lịch trước."""
+    mx = 0
+    for sec in exam.section_ids:
+        mx = max(mx, cohort_index_from_malop(sec))
+    return mx
+
+
+def same_course_khoa_nhom_waiver(e1: Exam, e2: Exam) -> bool:
+    """Cùng học phần (ca tách đề / cùng mã) — không áp lệnh «khác ngày theo Khoa_nhom» giữa các ca."""
+    a = (e1.course_prefix_7 or "").strip()
+    b = (e2.course_prefix_7 or "").strip()
+    if a and b and a == b:
+        return True
+    c1 = (e1.course_id or "").strip()
+    c2 = (e2.course_id or "").strip()
+    return bool(c1 and c2 and c1 == c2)
+
+
+def max_khoa_nhom_distinct_course_groups(exams: List[Exam]) -> Tuple[str, int]:
+    """Với mỗi hậu tố Khoa_nhom, đếm số nhóm môn (các ca cùng học phần gộp 1 nhóm). Trả (hậu tố, max nhóm)."""
+    key_to_indices: Dict[str, List[int]] = defaultdict(list)
+    for ei, e in enumerate(exams):
+        for k in exam_khoa_nhom_keys(e):
+            key_to_indices[k].append(ei)
+    worst_k, worst_n = "", 0
+    for k, idxs in key_to_indices.items():
+        uniq = sorted(set(idxs))
+        parent = {i: i for i in uniq}
+
+        def find(x: int) -> int:
+            p = x
+            while parent[p] != p:
+                p = parent[p]
+            return p
+
+        def union(a: int, b: int) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        for ia in range(len(uniq)):
+            for ib in range(ia + 1, len(uniq)):
+                a, b = uniq[ia], uniq[ib]
+                if same_course_khoa_nhom_waiver(exams[a], exams[b]):
+                    union(a, b)
+        n_groups = len({find(i) for i in uniq})
+        if n_groups > worst_n:
+            worst_n, worst_k = n_groups, k
+    return worst_k, worst_n
+
+
+def build_prefix_student_totals(exams: List[Exam]) -> Dict[str, int]:
+    """Số sinh viên duy nhất theo nhóm 7 ký tự đầu MalopHP (gộp mọi ca thi cùng học phần)."""
+    by_pfx: Dict[str, set[str]] = defaultdict(set)
+    for e in exams:
+        pfx = _malop_prefix_7_for_exam(e)
+        if not pfx:
+            continue
+        by_pfx[pfx].update(e.student_ids)
+    return {k: len(v) for k, v in by_pfx.items()}
+
+
+def _weekday_at_day_index(window: ScheduleWindow, day_idx: int) -> int:
+    return (window.start_date + timedelta(days=int(day_idx))).weekday()
+
+
+def day_allowed_for_exam_weekday_rule(
+    exam: Exam,
+    day_idx: int,
+    window: ScheduleWindow,
+    weekend_large_min_students: int,
+    prefix_totals: Dict[str, int],
+) -> bool:
+    """Môn đông (≥ ngưỡng SV theo prefix) chỉ T7/CN; môn khác: T2–T7 (không chủ nhật)."""
+    if weekend_large_min_students <= 0:
+        return True
+    pfx = _malop_prefix_7_for_exam(exam)
+    n = prefix_totals.get(pfx, 0)
+    wd = _weekday_at_day_index(window, day_idx)
+    if n >= weekend_large_min_students:
+        return wd in (5, 6)
+    return wd != 6
+
+
+def enumerate_feasible_slots_for_exam(
+    exam: Exam,
+    window: ScheduleWindow,
+    allowed_sessions_by_exam_id: Dict[str, List[int]],
+    fixed_slots: Dict[str, int] | None = None,
+    *,
+    weekend_large_min_students: int = 0,
+    prefix_totals: Dict[str, int] | None = None,
+    relax_weekday_rule: bool = False,
+) -> List[int]:
+    """Danh sách chỉ số ô thời gian (0..total_slots-1) khả dĩ cho một môn."""
+    fixed_slots = dict(fixed_slots or {})
+    eid = exam.exam_id
+    if eid in fixed_slots:
+        return [int(fixed_slots[eid])]
+    sessions = allowed_sessions_by_exam_id.get(eid, list(range(window.sessions_per_day)))
+    sessions = sorted({int(s) for s in sessions if 0 <= int(s) < window.sessions_per_day})
+    if not sessions:
+        return []
+    totals = prefix_totals or {}
+    slots: List[int] = []
+    for d in range(window.total_days):
+        if not relax_weekday_rule and weekend_large_min_students > 0:
+            if not day_allowed_for_exam_weekday_rule(
+                exam, d, window, weekend_large_min_students, totals
+            ):
+                continue
+        for s in sessions:
+            slots.append(d * window.sessions_per_day + s)
+    return slots
+
+
+def check_prep_no_time_by_prefix_hard(
+    violations: List[PrepViolation],
+    exams: List[Exam],
+    max_no_prep_ratio: float = 0.10,
+) -> List[str]:
+    """Điều kiện cứng: với mỗi học phần (7 ký tự đầu MalopHP), nếu > max_no_prep_ratio
+    số sinh viên của học phần đó có ít nhất một lần «không có thời gian ôn» trước môn thi
+    (required > 0 và actual_days ≤ 0) thì báo lỗi.
+
+    Trả về danh sách chuỗi mô tả từng học phần vi phạm (rỗng nếu pass).
+    """
+    exam_by_id = {e.exam_id: e for e in exams}
+    by_name: Dict[str, List[Exam]] = defaultdict(list)
+    for e in exams:
+        by_name[e.course_name].append(e)
+
+    prefix_students: Dict[str, set[str]] = {}
+    prefix_label: Dict[str, str] = {}
+    for e in exams:
+        pfx = _malop_prefix_7_for_exam(e)
+        if not pfx:
+            continue
+        if pfx not in prefix_students:
+            prefix_students[pfx] = set()
+            prefix_label[pfx] = e.course_name
+        prefix_students[pfx].update(e.student_ids)
+
+    prefix_bad: Dict[str, set[str]] = defaultdict(set)
+    for v in violations:
+        if v.required_days <= 0 or v.actual_days > 0:
+            continue
+        exam: Exam | None = None
+        eid = (v.later_exam_id or "").strip()
+        if eid and eid in exam_by_id:
+            exam = exam_by_id[eid]
+        else:
+            cand = by_name.get(v.later_exam, [])
+            if len(cand) == 1:
+                exam = cand[0]
+            else:
+                continue
+        pfx = _malop_prefix_7_for_exam(exam)
+        if not pfx or pfx not in prefix_students:
+            continue
+        if v.student_id in prefix_students[pfx]:
+            prefix_bad[pfx].add(v.student_id)
+
+    errors: List[str] = []
+    for pfx, total_set in sorted(prefix_students.items(), key=lambda x: x[0]):
+        total = len(total_set)
+        if total <= 0:
+            continue
+        bad = len(prefix_bad.get(pfx, set()))
+        if bad / total > max_no_prep_ratio + 1e-15:
+            pct = 100.0 * bad / total
+            errors.append(
+                f"Học phần mã 7 ký tự «{pfx}» ({prefix_label.get(pfx, '')}): "
+                f"{bad}/{total} sinh viên ({pct:.1f}%) không có thời gian ôn trước (ít nhất một môn thi) "
+                f"— vượt ngưỡng cứng {max_no_prep_ratio:.0%}."
+            )
+    return errors
 
 
 def compute_kpi(
@@ -221,4 +485,5 @@ def compute_kpi(
     for (day_str, _), load in by_slot.items():
         by_day[day_str] += load
     kpi.by_day_load = sorted(by_day.items())
+    kpi.prep_prefix_hard_errors = check_prep_no_time_by_prefix_hard(violations, exams)
     return kpi

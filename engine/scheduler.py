@@ -18,7 +18,13 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from ortools.sat.python import cp_model
 
-from .diagnostics import build_conflict_index
+from .diagnostics import (
+    build_conflict_index,
+    build_prefix_student_totals,
+    enumerate_feasible_slots_for_exam,
+    exam_khoa_nhom_keys,
+    same_course_khoa_nhom_waiver,
+)
 from .heuristic import HeuristicResult, heuristic_to_scheduled, lns_improve, schedule_greedy
 from .models import (
     Exam,
@@ -49,6 +55,7 @@ def _build_cpsat_model(
     warm_start: Dict[str, int] | None,
     optimize: bool,
     top_k_prep_pairs: int = 50000,
+    allowed_slot_domains: Optional[List[List[int]]] = None,
 ) -> Tuple[cp_model.CpModel, List[cp_model.IntVar], List[cp_model.IntVar]]:
     model = cp_model.CpModel()
     n = len(exams)
@@ -65,7 +72,12 @@ def _build_cpsat_model(
         sessions = sorted({int(s) for s in sessions if 0 <= int(s) < sessions_per_day})
         if not sessions:
             raise ValueError(f"Môn '{exam.course_name}' không có ca thi hợp lệ.")
-        allowed = [d * sessions_per_day + s for d in range(total_days) for s in sessions]
+        if allowed_slot_domains is not None:
+            allowed = allowed_slot_domains[i]
+        else:
+            allowed = [d * sessions_per_day + s for d in range(total_days) for s in sessions]
+        if not allowed:
+            raise ValueError(f"Môn '{exam.course_name}' không có ô thời gian hợp lệ sau lọc ngày.")
         slot_vars.append(
             model.NewIntVarFromDomain(cp_model.Domain.FromValues(allowed), f"slot_{i}")
         )
@@ -84,6 +96,14 @@ def _build_cpsat_model(
     # Hard: same slot ⇒ no conflict
     for (i, j), _ in conflicts.items():
         model.Add(slot_vars[i] != slot_vars[j])
+
+    # Khoa_nhom (4 ký tự cuối MalopHP): hai môn khác nhau cùng hậu tố ⇒ khác ngày (ca tách cùng học phần miễn).
+    for i in range(n):
+        for j in range(i + 1, n):
+            if same_course_khoa_nhom_waiver(exams[i], exams[j]):
+                continue
+            if exam_khoa_nhom_keys(exams[i]) & exam_khoa_nhom_keys(exams[j]):
+                model.Add(day_vars[i] != day_vars[j])
 
     # max_exams_per_day: dùng AddCumulative theo SV — gọn hơn reification per-day.
     if max_exams_per_day > 0:
@@ -210,6 +230,7 @@ def solve(
     rooms: List[Room],
     allowed_sessions_by_exam_id: Dict[str, List[int]] | None = None,
     session_labels: List[str] | None = None,
+    session_half: List[int] | None = None,
     prep_day_per_credit: float = 0.6,
     min_prep_days: float = 0.0,
     max_exams_per_day: int = 2,
@@ -223,6 +244,8 @@ def solve(
     lns_iterations: int = 3,
     lns_pool_size: int = 120,
     progress_cb: Optional[Callable[[int, str], None]] = None,
+    weekend_large_course_min_students: int = 0,
+    spread_prep_factor: float = 1.0,
 ) -> SolveResult:
     """Entry point chính.
 
@@ -245,6 +268,10 @@ def solve(
     progress(5, "Đang phân tích xung đột và chuẩn bị bước tham lam…")
     conflicts = build_conflict_index(exams)
 
+    prefix_totals: Dict[str, int] = {}
+    if weekend_large_course_min_students > 0:
+        prefix_totals = build_prefix_student_totals(exams)
+
     total_capacity = sum(r.capacity for r in rooms) if rooms else None
 
     relaxations: List[str] = []
@@ -263,6 +290,10 @@ def solve(
         base_slots=base_slots,
         balance_weight=balance_weight,
         soft_slot_cap=soft_slot_cap,
+        session_half=session_half,
+        weekend_large_course_min_students=weekend_large_course_min_students,
+        prefix_student_totals=prefix_totals,
+        spread_prep_factor=spread_prep_factor,
     )
     relaxations.extend(greedy.relaxations)
 
@@ -280,6 +311,12 @@ def solve(
                 total_capacity=total_capacity,
                 fixed_slots=fixed_slots,
                 base_slots=base_slots,
+                balance_weight=balance_weight,
+                soft_slot_cap=soft_slot_cap,
+                session_half=session_half,
+                weekend_large_course_min_students=weekend_large_course_min_students,
+                prefix_student_totals=prefix_totals,
+                spread_prep_factor=spread_prep_factor,
             )
             if len(relaxed.unplaced) < len(greedy.unplaced):
                 relaxations.append("Đã nới ràng buộc số ngày ôn tối thiểu về 0 ở bước tham lam.")
@@ -312,7 +349,10 @@ def solve(
                 balance_weight=balance_weight,
                 soft_slot_cap=soft_slot_cap,
                 fixed_slots=fixed_slots,
+                session_half=session_half,
                 progress_cb=progress,
+                weekend_large_course_min_students=weekend_large_course_min_students,
+                prefix_student_totals=prefix_totals,
             )
             if improved and improved != final_assignment:
                 final_assignment = improved
@@ -326,12 +366,45 @@ def solve(
 
     # CP-SAT polish chỉ chạy khi instance đủ nhỏ (tránh dựng model 10M+ vars).
     # Ngưỡng dựa trên: số môn × số slot ≤ 500_000, số xung đột ≤ 60_000.
-    cpsat_eligible = (
+    # Ngoài ra mỗi môn phải có ≥1 ô thời gian hợp lệ sau lọc thứ trong tuần.
+    cpsat_domains: Optional[List[List[int]]] = None
+    _cpsat_size_ok = (
         optimize_objective
         and remaining > 10.0
         and len(exams) * window.total_slots <= 500_000
         and len(conflicts) <= 60_000
     )
+    if _cpsat_size_ok:
+        doms: List[List[int]] = []
+        dom_ok = True
+        for ex in exams:
+            slots = enumerate_feasible_slots_for_exam(
+                ex,
+                window,
+                allowed_sessions_by_exam_id,
+                fixed_slots,
+                weekend_large_min_students=weekend_large_course_min_students,
+                prefix_totals=prefix_totals,
+                relax_weekday_rule=False,
+            )
+            if not slots:
+                slots = enumerate_feasible_slots_for_exam(
+                    ex,
+                    window,
+                    allowed_sessions_by_exam_id,
+                    fixed_slots,
+                    weekend_large_min_students=weekend_large_course_min_students,
+                    prefix_totals=prefix_totals,
+                    relax_weekday_rule=True,
+                )
+            if not slots:
+                dom_ok = False
+                break
+            doms.append(sorted(set(slots)))
+        if dom_ok:
+            cpsat_domains = doms
+
+    cpsat_eligible = _cpsat_size_ok and cpsat_domains is not None
 
     # ---- CP-SAT polish phase ----
     cpsat_used = False
@@ -350,6 +423,7 @@ def solve(
                 base_slots=base_slots,
                 warm_start=final_assignment,
                 optimize=True,
+                allowed_slot_domains=cpsat_domains,
             )
             status, values = _solve_cpsat(model, slot_vars, remaining, progress_cb=lambda _m: progress(75, "Đang chạy tối ưu SAT…"))
             if values is not None:
@@ -426,6 +500,7 @@ def solve_exam_timetable(
     rooms: List[Room],
     allowed_sessions_by_exam_id: Dict[str, List[int]] | None = None,
     session_labels: List[str] | None = None,
+    session_half: List[int] | None = None,
     prep_day_per_credit: float = 0.6,
     min_prep_days: float = 0.0,
     max_exams_per_day: int = 2,
@@ -442,6 +517,7 @@ def solve_exam_timetable(
         rooms=rooms,
         allowed_sessions_by_exam_id=allowed_sessions_by_exam_id,
         session_labels=session_labels,
+        session_half=session_half,
         prep_day_per_credit=prep_day_per_credit,
         min_prep_days=min_prep_days,
         max_exams_per_day=max_exams_per_day,
@@ -484,6 +560,7 @@ def detect_prep_violations(
                         later_exam=curr_exam.course_name,
                         required_days=required,
                         actual_days=float(actual),
+                        later_exam_id=curr_exam_id,
                     )
                 )
     return violations

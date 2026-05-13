@@ -2,12 +2,13 @@
 
 Ý tưởng:
 - Xây đồ thị xung đột (môn nào có chung SV thì có cạnh, trọng số = số SV trùng).
-- Sắp xếp môn theo độ "saturation" (bậc còn lại) giảm dần — giống DSATUR cho graph coloring.
+- Sắp xếp môn: **khóa mới trước** (2 chữ số đầu của 4 ký tự cuối MalopHP, lớn hơn → xếp trước), rồi priority / bậc / quy mô.
 - Với mỗi môn, chọn slot tốt nhất theo điểm tổng hợp:
     * Không xung đột (hard).
     * Không vi phạm max-exams/day (hard).
+    * Khoa_nhom (4 ký tự cuối MalopHP): hai môn khác nhau cùng hậu tố không cùng ngày (hard; ca tách cùng học phần miễn).
     * Tránh quá tải sức chứa (soft, càng cân bằng càng tốt).
-    * Đảm bảo prep-days với các môn đã xếp của SV (soft).
+    * Đảm bảo prep-days với các môn đã xếp của SV (soft; **khóa cũ** trong batch → trọng số prep thấp hơn).
     * PBL push-late: ưu tiên ngày cuối đợt cho môn priority cao.
 """
 from __future__ import annotations
@@ -17,7 +18,14 @@ from dataclasses import dataclass
 from math import ceil
 from typing import Dict, List, Optional, Tuple
 
-from .diagnostics import build_conflict_index
+from .diagnostics import (
+    build_conflict_index,
+    build_prefix_student_totals,
+    enumerate_feasible_slots_for_exam,
+    exam_khoa_nhom_keys,
+    exam_max_cohort_index,
+    same_course_khoa_nhom_waiver,
+)
 from .models import Exam, ScheduledExam, ScheduleWindow
 
 
@@ -32,23 +40,6 @@ def _slot_to_day_session(slot: int, sessions_per_day: int) -> Tuple[int, int]:
     return slot // sessions_per_day, slot % sessions_per_day
 
 
-def _build_allowed_slots(
-    exam_id: str,
-    allowed_sessions_by_exam_id: Dict[str, List[int]],
-    window: ScheduleWindow,
-    fixed_slots: Dict[str, int] | None = None,
-) -> List[int]:
-    if fixed_slots and exam_id in fixed_slots:
-        return [int(fixed_slots[exam_id])]
-    sessions = allowed_sessions_by_exam_id.get(
-        exam_id, list(range(window.sessions_per_day))
-    )
-    sessions = sorted({int(s) for s in sessions if 0 <= int(s) < window.sessions_per_day})
-    if not sessions:
-        return []
-    return [d * window.sessions_per_day + s for d in range(window.total_days) for s in sessions]
-
-
 def schedule_greedy(
     exams: List[Exam],
     window: ScheduleWindow,
@@ -61,6 +52,10 @@ def schedule_greedy(
     base_slots: Dict[str, int] | None = None,
     balance_weight: float = 1.0,
     soft_slot_cap: int | None = None,
+    session_half: List[int] | None = None,
+    weekend_large_course_min_students: int = 0,
+    prefix_student_totals: Dict[str, int] | None = None,
+    spread_prep_factor: float = 1.0,
 ) -> HeuristicResult:
     """Trả về HeuristicResult với map exam_id -> slot.
 
@@ -102,6 +97,19 @@ def schedule_greedy(
 
     relaxations: List[str] = []
     unplaced: List[str] = []
+    prefix_tot: Dict[str, int] = dict(prefix_student_totals or {})
+    if weekend_large_course_min_students > 0 and not prefix_tot:
+        prefix_tot = build_prefix_student_totals(exams)
+    weekday_relax_logged = False
+    # Cùng 7 ký tự mã học phần (MalopHP) → các ca tách phải cùng một buổi (sáng/chiều).
+    prefix_anchor: Dict[str, Tuple[int, int]] = {}
+
+    # Khoa_nhom = 4 ký tự cuối MalopHP: hai môn khác nhau cùng hậu tố không cùng ngày
+    # (trừ ca tách cùng học phần — same_course_khoa_nhom_waiver).
+    exam_khoa_keys = [exam_khoa_nhom_keys(e) for e in exams]
+    exam_cohort_rank = [exam_max_cohort_index(e) for e in exams]
+    max_cohort_in_batch = max(exam_cohort_rank, default=0)
+    day_khoa_registry: Dict[Tuple[int, str], List[int]] = defaultdict(list)
 
     # --- Đặt sẵn fixed_slots trước ---
     for exam_id, slot in fixed_slots.items():
@@ -109,7 +117,22 @@ def schedule_greedy(
             continue
         idx = exam_index[exam_id]
         exam = exams[idx]
+        slot = int(slot)
         day, _ = _slot_to_day_session(slot, window.sessions_per_day)
+        kko = exam_khoa_keys[idx]
+        conflict = False
+        for k in kko:
+            for oidx in day_khoa_registry.get((day, k), []):
+                if not same_course_khoa_nhom_waiver(exam, exams[oidx]):
+                    conflict = True
+                    break
+            if conflict:
+                break
+        if conflict:
+            relaxations.append(
+                f"Lịch cố định không tương thích Khoa_nhom (4 ký tự cuối MalopHP): bỏ ghim {exam_id}."
+            )
+            continue
         for sid in exam.student_ids:
             slot_used_students[slot].add(sid)
             day_exams_per_student[(sid, day)] += 1
@@ -117,14 +140,23 @@ def schedule_greedy(
         slot_load_students[slot] += exam.size
         day_load_students[day] += exam.size
         assignment[exam_id] = slot
+        if session_half and exam.course_prefix_7:
+            sess = slot % window.sessions_per_day
+            h = int(session_half[sess]) if sess < len(session_half) else 0
+            pfx = exam.course_prefix_7
+            if pfx not in prefix_anchor:
+                prefix_anchor[pfx] = (day, h)
+        for k in kko:
+            day_khoa_registry[(day, k)].append(idx)
 
-    # --- Sắp xếp môn theo (priority DESC, degree DESC, size DESC) ---
+    # --- Sắp xếp môn theo (khóa mới trước → priority → degree → size) ---
     remaining = [i for i, e in enumerate(exams) if e.exam_id not in assignment]
 
-    def _order_key(i: int) -> Tuple[int, int, int, int]:
+    def _order_key(i: int) -> Tuple[int, int, int, int, int]:
         e = exams[i]
-        # priority cao xếp trước (để được "cuối đợt"); rồi đến degree, size, neg-id (stable).
-        return (-e.priority, -len(adj[i]), -e.size, i)
+        # Hai chữ số đầu trong 4 ký tự cuối MalopHP: 25 > 22 → xếp trước để ưu tiên chỗ đẹp / prep cho khóa mới.
+        cohort = exam_cohort_rank[i]
+        return (-cohort, -e.priority, -len(adj[i]), -e.size, i)
 
     remaining.sort(key=_order_key)
 
@@ -152,11 +184,32 @@ def schedule_greedy(
                 for d in student_days_taken[sid]:
                     if abs(d - day) < req:
                         return False
+        if session_half and exam.course_prefix_7:
+            sess = slot % window.sessions_per_day
+            h = int(session_half[sess]) if sess < len(session_half) else 0
+            anchor = prefix_anchor.get(exam.course_prefix_7)
+            if anchor is not None:
+                ad, ah = anchor
+                if day != ad or h != ah:
+                    return False
+        keys = exam_khoa_keys[idx]
+        if keys:
+            for k in keys:
+                for oidx in day_khoa_registry.get((day, k), []):
+                    if oidx == idx:
+                        continue
+                    if not same_course_khoa_nhom_waiver(exam, exams[oidx]):
+                        return False
         return True
 
     def _commit(idx: int, slot: int) -> None:
         exam = exams[idx]
-        day, _ = _slot_to_day_session(slot, window.sessions_per_day)
+        day, sess = _slot_to_day_session(slot, window.sessions_per_day)
+        if session_half and exam.course_prefix_7:
+            h = int(session_half[sess]) if sess < len(session_half) else 0
+            pfx = exam.course_prefix_7
+            if pfx not in prefix_anchor:
+                prefix_anchor[pfx] = (day, h)
         for sid in exam.student_ids:
             slot_used_students[slot].add(sid)
             day_exams_per_student[(sid, day)] += 1
@@ -164,6 +217,8 @@ def schedule_greedy(
         slot_load_students[slot] += exam.size
         day_load_students[day] += exam.size
         assignment[exam.exam_id] = slot
+        for k in exam_khoa_keys[idx]:
+            day_khoa_registry[(day, k)].append(idx)
 
     def _score_slot(idx: int, slot: int) -> float:
         """Càng thấp càng tốt. Tổng hợp 4 thành phần điểm:
@@ -202,10 +257,17 @@ def schedule_greedy(
 
         score += balance_pen * balance_weight
 
-        # (3) Prep-day soft penalty: SV có môn gần đây thì giảm điểm slot này
+        # (3) Prep-day mềm — khóa cũ (số 2 chữ số nhỏ) chịu phạt nhẹ hơn (học lại / ít ưu tiên ôn tuyệt đối).
         req = max(min_prep_days, exam.credits * prep_day_per_credit)
         if req > 0:
             penalty = 0.0
+            cohort = exam_cohort_rank[idx]
+            if max_cohort_in_batch <= 0:
+                prep_w = 1.0
+            elif cohort >= max_cohort_in_batch:
+                prep_w = 1.0
+            else:
+                prep_w = max(0.35, cohort / max(max_cohort_in_batch, 1))
             # sampling cho môn rất đông SV để giữ O(n)
             sample = exam.student_ids if len(exam.student_ids) <= 300 else exam.student_ids[::max(1, len(exam.student_ids) // 300)]
             for sid in sample:
@@ -214,7 +276,7 @@ def schedule_greedy(
                     if diff < req:
                         penalty += (req - diff)
             scale = len(exam.student_ids) / max(1, len(sample))
-            score += penalty * scale * 0.05
+            score += penalty * scale * 0.05 * max(0.01, float(spread_prep_factor)) * prep_w
 
         # (4) Giữ gần base_slots khi repair
         prev = base_slots.get(exam.exam_id)
@@ -230,9 +292,31 @@ def schedule_greedy(
         ordered.sort(key=_order_key)
         for idx in ordered:
             exam = exams[idx]
-            allowed = _build_allowed_slots(
-                exam.exam_id, allowed_sessions_by_exam_id, window, fixed_slots
+            allowed = enumerate_feasible_slots_for_exam(
+                exam,
+                window,
+                allowed_sessions_by_exam_id,
+                fixed_slots,
+                weekend_large_min_students=weekend_large_course_min_students,
+                prefix_totals=prefix_tot,
+                relax_weekday_rule=False,
             )
+            if not allowed and weekend_large_course_min_students > 0:
+                allowed = enumerate_feasible_slots_for_exam(
+                    exam,
+                    window,
+                    allowed_sessions_by_exam_id,
+                    fixed_slots,
+                    weekend_large_min_students=weekend_large_course_min_students,
+                    prefix_totals=prefix_tot,
+                    relax_weekday_rule=True,
+                )
+                if allowed and not weekday_relax_logged:
+                    relaxations.append(
+                        "Không đủ ô thời gian theo quy tắc thứ trong tuần (T2–T7 / T7–CN cho môn đông): "
+                        "tạm bỏ lọc ngày để vẫn có lịch."
+                    )
+                    weekday_relax_logged = True
             if not allowed:
                 still_unplaced.append(idx)
                 continue
@@ -275,9 +359,27 @@ def schedule_greedy(
         # Chấm điểm thêm phạt xung đột
         for idx in list(leftover):
             exam = exams[idx]
-            allowed = _build_allowed_slots(
-                exam.exam_id, allowed_sessions_by_exam_id, window, fixed_slots
+            allowed = enumerate_feasible_slots_for_exam(
+                exam,
+                window,
+                allowed_sessions_by_exam_id,
+                fixed_slots,
+                weekend_large_min_students=weekend_large_course_min_students,
+                prefix_totals=prefix_tot,
+                relax_weekday_rule=weekday_relax_logged,
             )
+            if not allowed:
+                allowed = enumerate_feasible_slots_for_exam(
+                    exam,
+                    window,
+                    allowed_sessions_by_exam_id,
+                    fixed_slots,
+                    weekend_large_min_students=weekend_large_course_min_students,
+                    prefix_totals=prefix_tot,
+                    relax_weekday_rule=True,
+                )
+            if not allowed:
+                continue
             best_slot, best_pen = None, float("inf")
             for slot in allowed:
                 overlap = sum(1 for sid in exam.student_ids if sid in slot_used_students[slot])
@@ -310,7 +412,10 @@ def lns_improve(
     balance_weight: float = 1.0,
     soft_slot_cap: int | None = None,
     fixed_slots: Dict[str, int] | None = None,
+    session_half: List[int] | None = None,
     progress_cb=None,
+    weekend_large_course_min_students: int = 0,
+    prefix_student_totals: Dict[str, int] | None = None,
 ) -> Tuple[Dict[str, int], List[str]]:
     """Cải thiện assignment bằng cách lặp lại: chọn pool_size môn vi phạm prep
     nhiều nhất, gỡ ra, gọi lại greedy để re-place. Trả về (assignment mới, log).
@@ -322,6 +427,12 @@ def lns_improve(
     fixed_slots = fixed_slots or {}
     exam_index = {e.exam_id: i for i, e in enumerate(exams)}
     current = dict(assignment)
+
+    prefix_tot: Dict[str, int] = dict(prefix_student_totals or {})
+    if weekend_large_course_min_students > 0 and not prefix_tot:
+        prefix_tot = build_prefix_student_totals(exams)
+
+    keys_by_eid = {e.exam_id: exam_khoa_nhom_keys(e) for e in exams}
 
     def _compute_violation_score(asgn: Dict[str, int]) -> Tuple[int, Dict[str, int]]:
         """Trả về (total_violation_count, per_exam_violation_count)."""
@@ -360,6 +471,31 @@ def lns_improve(
     # Cấu trúc lưu trữ tăng cường để O(1) check.
 
     sessions_per_day = window.sessions_per_day
+
+    def _half_of(slot: int) -> int:
+        sess = slot % sessions_per_day
+        if session_half and 0 <= sess < len(session_half):
+            return int(session_half[sess])
+        return 0
+
+    def _prefix_feasible(eid: str, slot: int) -> bool:
+        ex = exams[exam_index[eid]]
+        pfx = ex.course_prefix_7
+        if not session_half or not pfx:
+            return True
+        day = slot // sessions_per_day
+        h = _half_of(slot)
+        siblings = [
+            e2
+            for e2 in current
+            if e2 != eid and exams[exam_index[e2]].course_prefix_7 == pfx
+        ]
+        if not siblings:
+            return True
+        ref = siblings[0]
+        rd = current[ref] // sessions_per_day
+        rh = _half_of(current[ref])
+        return day == rd and h == rh
 
     # Build per-student exam list
     student_to_exams: Dict[str, List[str]] = defaultdict(list)
@@ -430,6 +566,23 @@ def lns_improve(
                 return True
         return False
 
+    def _khoa_feasible(eid: str, slot: int) -> bool:
+        keys = keys_by_eid.get(eid, frozenset())
+        if not keys:
+            return True
+        ex = exams[exam_index[eid]]
+        new_day = slot // sessions_per_day
+        for other_eid, oslot in current.items():
+            if other_eid == eid:
+                continue
+            if oslot // sessions_per_day != new_day:
+                continue
+            if same_course_khoa_nhom_waiver(ex, exams[exam_index[other_eid]]):
+                continue
+            if keys & keys_by_eid.get(other_eid, frozenset()):
+                return False
+        return True
+
     def _move(eid: str, new_slot: int) -> None:
         exam = exams[exam_index[eid]]
         old_slot = current[eid]
@@ -456,12 +609,32 @@ def lns_improve(
             return 0.0
         return (projected - soft_slot_cap) * PEAK_WEIGHT
 
-    # Pre-compute allowed slots per exam
+    # Pre-compute allowed slots per exam (thứ trong tuần: T2–T7 / T7–CN cho môn đông)
     allowed_by_exam: Dict[str, List[int]] = {}
     for eid in current.keys():
-        sessions = allowed_sessions_by_exam_id.get(eid, list(range(sessions_per_day)))
-        sessions = sorted({int(s) for s in sessions if 0 <= int(s) < sessions_per_day})
-        allowed_by_exam[eid] = [d * sessions_per_day + s for d in range(window.total_days) for s in sessions]
+        if eid not in exam_index:
+            continue
+        ex = exams[exam_index[eid]]
+        slots = enumerate_feasible_slots_for_exam(
+            ex,
+            window,
+            allowed_sessions_by_exam_id,
+            fixed_slots,
+            weekend_large_min_students=weekend_large_course_min_students,
+            prefix_totals=prefix_tot,
+            relax_weekday_rule=False,
+        )
+        if not slots:
+            slots = enumerate_feasible_slots_for_exam(
+                ex,
+                window,
+                allowed_sessions_by_exam_id,
+                fixed_slots,
+                weekend_large_min_students=weekend_large_course_min_students,
+                prefix_totals=prefix_tot,
+                relax_weekday_rule=True,
+            )
+        allowed_by_exam[eid] = slots
 
     # Slot load tracking (SV per slot) — để LNS biết peak nào đang đông
     slot_size_load: Dict[int, int] = defaultdict(int)
@@ -507,6 +680,10 @@ def lns_improve(
                 if _conflict_at_slot(eid, slot):
                     continue
                 if _violates_max_per_day(eid, slot):
+                    continue
+                if not _khoa_feasible(eid, slot):
+                    continue
+                if not _prefix_feasible(eid, slot):
                     continue
                 v = _vio_for_exam(eid, slot)
                 p = _peak_cost(eid, slot)

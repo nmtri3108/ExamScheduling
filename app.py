@@ -531,7 +531,20 @@ with tabs[0]:
     c1.metric("Môn đã xếp", f"{len(result.scheduled)} / {result.stats.num_exams}")
     c2.metric("Sinh viên", f"{result.stats.num_students:,}")
     c3.metric("Ô thời gian đã dùng / tổng", f"{kpi.slots_used} / {result.stats.num_slots}")
-    c4.metric("Vi phạm ngày ôn", f"{kpi.prep_violation_count:,}")
+    c4.metric(
+        "Vi phạm ngày ôn",
+        f"{kpi.prep_violation_count:,}",
+        delta=(
+            f"Cùng-ngày: {kpi.same_day_violation_count:,}"
+            if kpi.same_day_violation_count
+            else "Không có cùng-ngày"
+        ),
+        delta_color=("inverse" if kpi.same_day_violation_count else "normal"),
+        help=(
+            "Cùng-ngày = số cặp môn liên tiếp của SV có 0 ngày ôn (thi cùng ngày). "
+            "Đây là chỉ số đau nhất; nên gần 0 nhất có thể."
+        ),
+    )
 
     hard_errs = getattr(kpi, "prep_prefix_hard_errors", None) or []
     if hard_errs:
@@ -808,6 +821,10 @@ kpi_rows = [
     ("Ô thời gian đã dùng", kpi.slots_used),
     ("Tổng số ô thời gian", result.stats.num_slots),
     ("Số vi phạm ngày ôn", kpi.prep_violation_count),
+    ("Trong đó vi phạm cùng-ngày (0 ngày ôn)", kpi.same_day_violation_count),
+    ("Số SV bị vi phạm cùng-ngày", kpi.same_day_violation_students),
+    ("Khoảng ôn trung bình của các cặp vi phạm (ngày)", round(kpi.avg_prep_gap, 2)),
+    ("Khoảng ôn nhỏ nhất ghi nhận (ngày)", round(kpi.min_prep_gap, 2)),
     ("Điểm vị trí PBL (0–1)", round(kpi.pbl_position_score, 3)),
     ("Trung bình SV / ca", round(kpi.avg_students_per_slot, 1)),
     ("Cao nhất SV / ca", kpi.max_students_per_slot),

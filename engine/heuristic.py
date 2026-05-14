@@ -258,9 +258,12 @@ def schedule_greedy(
         score += balance_pen * balance_weight
 
         # (3) Prep-day mềm — khóa cũ (số 2 chữ số nhỏ) chịu phạt nhẹ hơn (học lại / ít ưu tiên ôn tuyệt đối).
+        # • Phần deficit dùng bậc 2 để worst-case (gap=0, deficit lớn) dominate scoring.
+        # • Phần same_day_count tách riêng, hệ số mạnh nhưng KHÔNG cứng (cho phép vi phạm khi không còn lựa chọn).
         req = max(min_prep_days, exam.credits * prep_day_per_credit)
         if req > 0:
-            penalty = 0.0
+            deficit_sq_sum = 0.0
+            same_day_count = 0
             cohort = exam_cohort_rank[idx]
             if max_cohort_in_batch <= 0:
                 prep_w = 1.0
@@ -268,15 +271,21 @@ def schedule_greedy(
                 prep_w = 1.0
             else:
                 prep_w = max(0.35, cohort / max(max_cohort_in_batch, 1))
-            # sampling cho môn rất đông SV để giữ O(n)
             sample = exam.student_ids if len(exam.student_ids) <= 300 else exam.student_ids[::max(1, len(exam.student_ids) // 300)]
             for sid in sample:
                 for d in student_days_taken[sid]:
                     diff = abs(d - day)
                     if diff < req:
-                        penalty += (req - diff)
+                        deficit = req - diff
+                        deficit_sq_sum += deficit * deficit
+                        if diff == 0:
+                            same_day_count += 1
             scale = len(exam.student_ids) / max(1, len(sample))
-            score += penalty * scale * 0.05 * max(0.01, float(spread_prep_factor)) * prep_w
+            spread_w = max(0.01, float(spread_prep_factor))
+            score += deficit_sq_sum * scale * 0.05 * spread_w * prep_w
+            # Same-day: trọng số ~0.5 base, scale với spread_prep_factor → user vẫn kiểm soát được.
+            # Với spread=1.75 (default app), hiệu lực ~0.875 / 1 SV-same-day → đủ mạnh nhưng không khoá cứng.
+            score += same_day_count * scale * 0.5 * spread_w * prep_w
 
         # (4) Giữ gần base_slots khi repair
         prev = base_slots.get(exam.exam_id)
@@ -434,13 +443,17 @@ def lns_improve(
 
     keys_by_eid = {e.exam_id: exam_khoa_nhom_keys(e) for e in exams}
 
-    def _compute_violation_score(asgn: Dict[str, int]) -> Tuple[int, Dict[str, int]]:
-        """Trả về (total_violation_count, per_exam_violation_count)."""
-        # Map exam_id -> day
+    def _compute_violation_score(asgn: Dict[str, int]) -> Tuple[int, int, Dict[str, float]]:
+        """Trả về (total_count, same_day_count, per_exam_severity).
+
+        • total_count: tổng số cặp vi phạm (giữ semantics cũ để báo cáo).
+        • same_day_count: số cặp vi phạm với gap=0 (chỉ số người dùng quan tâm).
+        • per_exam_severity: điểm severity gán cho từng exam (dùng để ưu tiên candidate
+          khi LNS chọn môn để dịch chuyển). Severity = base count + α·deficit + β·1[gap=0].
+        """
         exam_day: Dict[str, int] = {
             eid: slot // window.sessions_per_day for eid, slot in asgn.items()
         }
-        # Per-student exam list (sorted by day)
         per_student: Dict[str, List[Tuple[int, str]]] = defaultdict(list)
         for eid, day in exam_day.items():
             if eid not in exam_index:
@@ -448,8 +461,9 @@ def lns_improve(
             exam = exams[exam_index[eid]]
             for sid in exam.student_ids:
                 per_student[sid].append((day, eid))
-        per_exam_vio: Dict[str, int] = defaultdict(int)
+        per_exam_sev: Dict[str, float] = defaultdict(float)
         total = 0
+        same_day = 0
         for sid, entries in per_student.items():
             entries.sort()
             for i in range(1, len(entries)):
@@ -457,14 +471,23 @@ def lns_improve(
                 curr_day, curr_eid = entries[i]
                 curr_exam = exams[exam_index[curr_eid]]
                 req = curr_exam.credits * prep_day_per_credit
-                if (curr_day - prev_day) + 1e-9 < req:
-                    per_exam_vio[curr_eid] += 1
-                    per_exam_vio[prev_eid] += 1
+                gap = curr_day - prev_day
+                if gap + 1e-9 < req:
                     total += 1
-        return total, per_exam_vio
+                    deficit = req - gap
+                    sev = 1.0 + 0.3 * deficit
+                    if gap == 0:
+                        same_day += 1
+                        sev += 2.0
+                    per_exam_sev[curr_eid] += sev
+                    per_exam_sev[prev_eid] += sev
+        return total, same_day, per_exam_sev
 
-    base_vio, _ = _compute_violation_score(current)
-    logs.append(f"Cải tiến LNS: số vi phạm ngày ôn ban đầu = {base_vio:,}")
+    base_vio, base_same_day, _ = _compute_violation_score(current)
+    logs.append(
+        f"Cải tiến LNS: vi phạm ngày ôn ban đầu = {base_vio:,} "
+        f"(trong đó cùng-ngày / 0 ngày ôn = {base_same_day:,})"
+    )
 
     # Move-based local search: với mỗi môn vi phạm nhiều, thử di chuyển sang slot tốt hơn.
     # Đánh giá delta = vi phạm prep & xung đột cứng (no-overlap) & max-day.
@@ -516,33 +539,46 @@ def lns_improve(
             slot_students[slot].add(sid)
             student_day_count[(sid, day)] += 1
 
-    def _vio_for_exam(eid: str, slot: int) -> int:
-        """Số vi phạm prep liên quan đến exam này (nếu nó ở slot)."""
+    def _vio_for_exam(eid: str, slot: int) -> float:
+        """Severity-weighted điểm vi phạm prep liên quan đến exam này (nếu đặt ở slot).
+
+        Quy ước: với cặp (X, Y), môn "sau" là người sort lớn hơn theo (day, eid) — giống
+        `_compute_violation_score` để giữ nhất quán. Threshold dùng req của môn sau, đúng
+        ý nghĩa "môn sau cần ngày ôn trước nó".
+
+        Điểm = 1.0 (base count) + 0.3·deficit + 2.0·1[gap==0]. Dùng cho LNS so sánh delta
+        khi di chuyển; vì cả 2 nhánh (X là môn trước / X là môn sau) đều được xét, LNS sẽ
+        nhận ra cơ hội dịch chuyển X kể cả khi X là môn trước trong cặp vi phạm.
+        """
         if eid not in exam_index:
-            return 0
-        exam = exams[exam_index[eid]]
-        day = slot // sessions_per_day
-        req = exam.credits * prep_day_per_credit
-        vio = 0
-        for sid in exam.student_ids:
+            return 0.0
+        exam_x = exams[exam_index[eid]]
+        day_x = slot // sessions_per_day
+        req_x = exam_x.credits * prep_day_per_credit
+        sev = 0.0
+        for sid in exam_x.student_ids:
             for other_eid in student_to_exams[sid]:
                 if other_eid == eid:
                     continue
                 other_slot = current.get(other_eid)
                 if other_slot is None:
                     continue
-                other_day = other_slot // sessions_per_day
-                gap = abs(day - other_day)
-                if gap + 1e-9 < req:
-                    vio += 1
-                other_exam = exams[exam_index[other_eid]]
-                req_other = other_exam.credits * prep_day_per_credit
-                # Đếm thêm chiều ngược (other vs this); nhưng nếu req khác có thể khác
-                # Để đơn giản, dùng max(req, req_other) sẽ overcount; ta tách 2 chiều:
-                if other_eid != eid and gap + 1e-9 < req_other:
-                    # đã được tính khi xét exam khác, đừng double-count
-                    pass
-        return vio
+                day_y = other_slot // sessions_per_day
+                req_y = exams[exam_index[other_eid]].credits * prep_day_per_credit
+                # Chọn threshold theo môn "sau" (đồng bộ với _compute_violation_score).
+                if (day_x, eid) > (day_y, other_eid):
+                    threshold = req_x
+                else:
+                    threshold = req_y
+                if threshold <= 0:
+                    continue
+                gap = abs(day_x - day_y)
+                if gap + 1e-9 < threshold:
+                    deficit = threshold - gap
+                    sev += 1.0 + 0.3 * deficit
+                    if gap == 0:
+                        sev += 2.0
+        return sev
 
     def _conflict_at_slot(eid: str, slot: int) -> bool:
         exam = exams[exam_index[eid]]
@@ -644,6 +680,67 @@ def lns_improve(
 
     PEAK_WEIGHT = 0.001  # mỗi SV vượt cap đáng giá 0.001 vi phạm
 
+    def _same_day_and_sev_for_exam(eid: str, slot: int) -> Tuple[int, float]:
+        """Trả về (số cặp same-day liên quan tới eid, severity tổng) khi đặt eid ở slot.
+        Dùng cho pass cuối — tách rõ chỉ số same-day để ưu tiên giảm trước."""
+        if eid not in exam_index:
+            return 0, 0.0
+        exam_x = exams[exam_index[eid]]
+        day_x = slot // sessions_per_day
+        req_x = exam_x.credits * prep_day_per_credit
+        sd_count = 0
+        sev = 0.0
+        for sid in exam_x.student_ids:
+            for other_eid in student_to_exams[sid]:
+                if other_eid == eid:
+                    continue
+                other_slot = current.get(other_eid)
+                if other_slot is None:
+                    continue
+                day_y = other_slot // sessions_per_day
+                req_y = exams[exam_index[other_eid]].credits * prep_day_per_credit
+                if (day_x, eid) > (day_y, other_eid):
+                    threshold = req_x
+                else:
+                    threshold = req_y
+                if threshold <= 0:
+                    continue
+                gap = abs(day_x - day_y)
+                if gap + 1e-9 < threshold:
+                    deficit = threshold - gap
+                    sev += 1.0 + 0.3 * deficit
+                    if gap == 0:
+                        sd_count += 1
+                        sev += 2.0
+        return sd_count, sev
+
+    def _collect_same_day_exam_ids() -> List[str]:
+        """Liệt kê (không trùng) các exam_id đang có ≥1 cặp same-day vi phạm. Dùng cho pass cuối."""
+        result: List[str] = []
+        seen: set[str] = set()
+        for sid, eids in student_to_exams.items():
+            if len(eids) < 2:
+                continue
+            entries = sorted(
+                ((current[e] // sessions_per_day, e) for e in eids if e in current),
+                key=lambda x: (x[0], x[1]),
+            )
+            for i in range(1, len(entries)):
+                d_prev, e_prev = entries[i - 1]
+                d_curr, e_curr = entries[i]
+                if d_prev != d_curr:
+                    continue
+                req_curr = exams[exam_index[e_curr]].credits * prep_day_per_credit
+                if req_curr <= 0:
+                    continue
+                if e_prev not in seen:
+                    seen.add(e_prev)
+                    result.append(e_prev)
+                if e_curr not in seen:
+                    seen.add(e_curr)
+                    result.append(e_curr)
+        return result
+
     no_improve_count = 0
     for it in range(iterations):
         if progress_cb:
@@ -651,26 +748,27 @@ def lns_improve(
                 int(50 + (it / max(1, iterations)) * 20),
                 f"Bước 2/3: vòng cải tiến LNS thứ {it + 1}/{iterations}…",
             )
-        total_vio, per_exam_vio = _compute_violation_score(current)
+        total_vio, same_day_vio, per_exam_sev = _compute_violation_score(current)
         if total_vio == 0:
             break
-        # Sắp xếp ứng viên: nhiều vi phạm trước
+        # Sắp xếp ứng viên theo severity (nặng nhất trước) — môn liên quan đến same-day
+        # sẽ tự động bubble lên vì severity của các cặp gap=0 cao hơn ~3x cặp gap=1.
         ranked = sorted(
             (
                 (eid, v)
-                for eid, v in per_exam_vio.items()
+                for eid, v in per_exam_sev.items()
                 if eid not in fixed_slots
             ),
             key=lambda x: -x[1],
         )[:pool_size]
         moved = 0
         before = total_vio
+        before_same_day = same_day_vio
         for eid, _ in ranked:
             old_slot = current[eid]
             cur_vio = _vio_for_exam(eid, old_slot)
             cur_peak = _peak_cost(eid, old_slot)
-            # Cho phép move nếu slot hiện tại có peak cost (slot đông) — kể cả vio=0
-            if cur_vio == 0 and cur_peak == 0:
+            if cur_vio <= 0 and cur_peak <= 0:
                 continue
             best_slot = old_slot
             best_score = cur_vio + cur_peak
@@ -694,19 +792,74 @@ def lns_improve(
             if best_slot != old_slot:
                 _move(eid, best_slot)
                 moved += 1
-        after, _ = _compute_violation_score(current)
-        if after < before:
+        after, after_same_day, _ = _compute_violation_score(current)
+        improved = after < before or after_same_day < before_same_day
+        if improved:
             logs.append(
-                f"Vòng LNS thứ {it + 1}: {before:,} → {after:,} (giảm {before - after:,}, đã chuyển {moved} môn)"
+                f"Vòng LNS thứ {it + 1}: vi phạm {before:,} → {after:,} "
+                f"(cùng-ngày {before_same_day:,} → {after_same_day:,}, đã chuyển {moved} môn)"
             )
             base_vio = after
             no_improve_count = 0
         else:
-            logs.append(f"Vòng LNS thứ {it + 1}: {before:,} (không cải thiện, đã thử chuyển {moved} môn).")
+            logs.append(
+                f"Vòng LNS thứ {it + 1}: vi phạm {before:,} (cùng-ngày {before_same_day:,}) "
+                f"— không cải thiện, đã thử chuyển {moved} môn."
+            )
             no_improve_count += 1
             if no_improve_count >= 2:
-                logs.append("Dừng cải tiến LNS sớm: hai vòng liên tiếp không cải thiện.")
+                logs.append("Dừng cải tiến LNS chính sớm: hai vòng liên tiếp không cải thiện.")
                 break
+
+    # ---- Pass cuối: dedicated same-day breaker ----
+    # Bounded cost (chỉ duyệt exam còn dính same-day). Chấp nhận move khi giảm cùng-ngày
+    # hoặc giữ nguyên cùng-ngày nhưng giảm severity tổng. Đây không phải tinh chỉnh dữ liệu
+    # cụ thể — đó là cấu trúc thuật toán: tách giai đoạn tổng quát (LNS chính) và giai đoạn
+    # targeted (same-day) để tránh stuck ở local optimum nhẹ.
+    _, same_day_left, _ = _compute_violation_score(current)
+    if same_day_left > 0:
+        if progress_cb:
+            progress_cb(
+                72,
+                f"Bước 2/3: pass cuối — đang phá {same_day_left:,} cặp cùng-ngày…",
+            )
+        same_day_targets = _collect_same_day_exam_ids()
+        same_day_targets = [eid for eid in same_day_targets if eid not in fixed_slots]
+        moved_sd = 0
+        for eid in same_day_targets:
+            old_slot = current[eid]
+            cur_sd, cur_sev = _same_day_and_sev_for_exam(eid, old_slot)
+            if cur_sd <= 0:
+                continue
+            cur_peak = _peak_cost(eid, old_slot)
+            best_slot = old_slot
+            best_pair = (cur_sd, cur_sev + cur_peak)
+            for slot in allowed_by_exam[eid]:
+                if slot == old_slot:
+                    continue
+                if _conflict_at_slot(eid, slot):
+                    continue
+                if _violates_max_per_day(eid, slot):
+                    continue
+                if not _khoa_feasible(eid, slot):
+                    continue
+                if not _prefix_feasible(eid, slot):
+                    continue
+                new_sd, new_sev = _same_day_and_sev_for_exam(eid, slot)
+                new_peak = _peak_cost(eid, slot)
+                pair = (new_sd, new_sev + new_peak)
+                # Ưu tiên giảm same_day trước, rồi mới đến severity tổng.
+                if pair < best_pair:
+                    best_pair = pair
+                    best_slot = slot
+            if best_slot != old_slot:
+                _move(eid, best_slot)
+                moved_sd += 1
+        after_total, after_sd, _ = _compute_violation_score(current)
+        logs.append(
+            f"Pass cuối (same-day): cùng-ngày {same_day_left:,} → {after_sd:,} "
+            f"(tổng vi phạm hiện {after_total:,}, đã chuyển {moved_sd} môn)"
+        )
 
     return current, logs
 

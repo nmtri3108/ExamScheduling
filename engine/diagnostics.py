@@ -219,6 +219,11 @@ class SchedulingKPI:
     max_students_per_slot: int = 0
     prep_violation_count: int = 0
     prep_violation_students: int = 0
+    # Vi phạm có actual_days ≤ 0 (cùng ngày / "0 ngày ôn") — chỉ số đau nhất cho SV.
+    same_day_violation_count: int = 0
+    same_day_violation_students: int = 0
+    avg_prep_gap: float = 0.0          # ngày ôn trung bình giữa các cặp môn liên tiếp của SV
+    min_prep_gap: float = 0.0          # ngày ôn nhỏ nhất ghi nhận
     pbl_position_score: float = 1.0   # 1.0 = tất cả PBL ở cuối đợt
     by_day_load: List[Tuple[str, int]] = field(default_factory=list)
     # Điều kiện cứng: >10% SV / học phần (7 ký tự MalopHP) không có ngày ôn (thực tế ≤0)
@@ -471,6 +476,16 @@ def compute_kpi(
         kpi.max_students_per_slot = max(loads)
     kpi.prep_violation_count = len(violations)
     kpi.prep_violation_students = len({v.student_id for v in violations})
+    # Vi phạm "0 ngày ôn" — actual_days ≤ 0 và required_days > 0 (cùng ngày hoặc earlier).
+    same_day_vios = [v for v in violations if v.required_days > 0 and v.actual_days <= 0]
+    kpi.same_day_violation_count = len(same_day_vios)
+    kpi.same_day_violation_students = len({v.student_id for v in same_day_vios})
+
+    # Thống kê gap (khoảng cách thực tế giữa các cặp môn vi phạm)
+    if violations:
+        gaps = [float(v.actual_days) for v in violations]
+        kpi.avg_prep_gap = sum(gaps) / len(gaps)
+        kpi.min_prep_gap = min(gaps)
 
     # PBL position score
     pbl_items = [item for item in scheduled if exam_map.get(item.exam_id) and exam_map[item.exam_id].priority > 0]

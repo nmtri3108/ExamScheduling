@@ -137,7 +137,10 @@ def _build_cpsat_model(
 
     penalty_terms = []
 
-    # Soft prep-day penalty — giới hạn top_k cặp xung đột nặng nhất để giữ mô hình gọn
+    # Soft prep-day penalty — giới hạn top_k cặp xung đột nặng nhất để giữ mô hình gọn.
+    # Severity = (req - gap) tuyến tính + bonus riêng cho gap=0 (same-day): mỗi cặp xung đột
+    # có một boolean "same_day" được kích hoạt khi abs_diff == 0; trọng số same-day cao hơn
+    # ~5x trọng số 1 đơn vị deficit để CP-SAT cũng ưu tiên phá same-day giống greedy/LNS.
     if optimize and prep_day_per_credit > 0 and conflicts:
         sorted_pairs = sorted(conflicts.items(), key=lambda kv: -kv[1])[:top_k_prep_pairs]
         for (i, j), overlap in sorted_pairs:
@@ -150,7 +153,14 @@ def _build_cpsat_model(
             model.AddAbsEquality(abs_diff, diff)
             lack = model.NewIntVar(0, req, f"lack_{i}_{j}")
             model.Add(lack >= req - abs_diff)
-            penalty_terms.append(lack * max(1, overlap // 5))
+            pair_w = max(1, overlap // 5)
+            penalty_terms.append(lack * pair_w)
+            # Same-day boolean: kích hoạt khi abs_diff == 0. Hệ số ~5x deficit weight để
+            # giảm same-day là ưu tiên hơn là chỉ thu hẹp deficit.
+            same_day_bool = model.NewBoolVar(f"sd_{i}_{j}")
+            model.Add(abs_diff == 0).OnlyEnforceIf(same_day_bool)
+            model.Add(abs_diff >= 1).OnlyEnforceIf(same_day_bool.Not())
+            penalty_terms.append(same_day_bool * (5 * pair_w))
 
     # PBL push-late
     if optimize:

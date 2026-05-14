@@ -28,7 +28,7 @@ from engine.io import (
     load_rooms,
     load_schedule_window,
 )
-from engine.i18n import hien_thi_loai_hinh, hien_thi_phuong_thuc
+from engine.i18n import hien_thi_loai_hinh, hien_thi_phuong_thuc, markdown_canh_bao_hoc_phan_thieu_ngay_on
 from engine.rooms import assign_rooms_and_invigilators
 from engine.scheduler import detect_prep_violations, solve
 
@@ -51,6 +51,13 @@ def _save_uploaded(uploaded_file) -> Path:
 
 def _parse_csv(text: str) -> List[str]:
     return [x.strip() for x in str(text).split(",") if x.strip()]
+
+
+def _show_hoc_phan_prep_hard_errors(kpi) -> None:
+    """Hiển thị cùng một nội dung ở tab Tổng quan và Chẩn đoán (tránh lệch chữ)."""
+    hard_errs = getattr(kpi, "prep_prefix_hard_errors", None) or []
+    if hard_errs:
+        st.error(markdown_canh_bao_hoc_phan_thieu_ngay_on(hard_errs))
 
 
 def _build_slot_config(theory: str, oral: str, computer: str):
@@ -192,8 +199,9 @@ def _run_pipeline(
 
 st.title("📅 Hệ thống xếp lịch thi tín chỉ")
 st.caption(
-    "Thứ trong tuần: môn thường ưu tiên thứ Hai–thứ Bảy; môn đông (≥ ngưỡng SV theo 7 ký tự MalopHP) "
-    "chỉ thứ Bảy/Chủ nhật. Kết hợp tham lam (DSATUR), LNS và SAT khi đủ nhỏ."
+    "Ngày trong tuần: môn thường xếp thứ Hai–thứ Bảy (không Chủ nhật). "
+    "Môn rất đông (tổng SV theo **7 ký tự đầu** mã lớp ≥ ngưỡng ở sidebar) chỉ xếp **thứ Bảy hoặc Chủ nhật**. "
+    "Giải gồm: tham lam (DSATUR) → cải tiến LNS → tối ưu ràng buộc (SAT) nếu bài toán đủ nhỏ."
 )
 
 with st.sidebar:
@@ -201,33 +209,43 @@ with st.sidebar:
 
     with st.expander("Tham số học vụ", expanded=True):
         prep_day_per_credit = st.number_input(
-            "Số ngày ôn / 1 tín chỉ", min_value=0.1, value=0.6, step=0.1,
-            help="Ví dụ 0.6 ngày × 3 TC = ~2 ngày ôn cho môn 3 TC.",
+            "Số ngày nghỉ ôn mong muốn / 1 tín chỉ",
+            min_value=0.1,
+            value=0.6,
+            step=0.1,
+            help="Ví dụ 0,6 × 3 tín chỉ ≈ gần 2 ngày nghỉ giữa hai môn liên tiếp của sinh viên (mục tiêu mềm, không phải lệnh cứng).",
         )
         min_prep_days = st.number_input(
-            "Số ngày ôn tối thiểu (cứng)", min_value=0.0, value=1.0, step=0.5,
-            help="0 = không ép cứng. Mặc định 1 = mỗi môn ít nhất 1 ngày ôn (theo tín chỉ và ngưỡng này).",
+            "Ngày nghỉ ôn tối thiểu (ràng buộc cứng)",
+            min_value=0.0,
+            value=1.0,
+            step=0.5,
+            help="0 = tắt. Đặt 1 nghĩa là giữa hai môn liên tiếp phải cách ít nhất 1 ngày theo lịch (kết hợp với ô trên).",
         )
         max_exams_per_day = st.number_input(
-            "Tối đa môn / sinh viên / ngày", min_value=1, value=2, step=1,
+            "Tối đa bao nhiêu môn một sinh viên được thi trong cùng một ngày",
+            min_value=1,
+            value=2,
+            step=1,
         )
         weekend_large_min_sv = st.number_input(
-            "Ngưỡng SV (7 ký tự MalopHP) → môn đông chỉ thi thứ Bảy hoặc Chủ nhật",
+            "Ngưỡng «môn rất đông»: chỉ thi cuối tuần (T7–CN)",
             min_value=0,
             value=800,
             step=50,
             help=(
-                "0 = tắt. Tổng SV duy nhất theo 7 ký tự đầu mã lớp học phần: nếu ≥ ngưỡng thì "
-                "chỉ xếp thứ Bảy/Chủ nhật. Dưới ngưỡng: chỉ thứ Hai–thứ Bảy (không Chủ nhật)."
+                "0 = tắt quy tắc. Khi bật: đếm **số sinh viên khác nhau** theo **7 ký tự đầu** mã lớp học phần; "
+                "nếu ≥ ngưỡng thì môn đó chỉ xếp thứ Bảy hoặc Chủ nhật. "
+                "Dưới ngưỡng: thứ Hai–thứ Bảy (không Chủ nhật)."
             ),
         )
         spread_prep_factor = st.slider(
-            "Độ ưu tiên giãn ngày ôn (scoring tham lam)",
+            "Ưu tiên giãn lịch (điểm phạt trong bước tham lam)",
             min_value=1.0,
             max_value=3.0,
             value=1.75,
             step=0.05,
-            help="Tăng để thuật toán phạt mạnh hơn khi khoảng cách ôn giữa các môn quá hẹp (soft).",
+            help="Càng cao thì càng cố tránh xếp hai môn của cùng sinh viên quá sát nhau (mục tiêu mềm).",
         )
 
     with st.expander("Bộ ca thi theo loại", expanded=True):
@@ -247,78 +265,88 @@ with st.sidebar:
 
     with st.expander("Bộ giải và tối ưu", expanded=False):
         solver_time_limit = st.number_input(
-            "Thời gian tối đa (giây)", min_value=10, value=600, step=10,
-            help="Giới hạn thời gian cho bước tối ưu SAT. Bước tham lam thường dưới vài phút.",
+            "Giới hạn thời gian cho bước tối ưu (giây)",
+            min_value=10,
+            value=600,
+            step=10,
+            help="Chủ yếu áp dụng cho bước tối ưu ràng buộc (SAT). Bước tham lam + LNS thường xong trước đó.",
         )
         optimize_objective = st.checkbox(
-            "Bật tối ưu (LNS + bước SAT)", value=True,
-            help="Bước cải tiến cục bộ (LNS) chạy nhanh. Tối ưu ràng buộc (SAT) chỉ chạy khi bài toán đủ nhỏ.",
+            "Bật cải tiến sau tham lam (LNS + SAT nếu đủ nhỏ)",
+            value=True,
+            help="LNS: sửa cục bộ, thường rất hữu ích. SAT: chỉ chạy khi số môn và xung đột nằm trong ngưỡng an toàn.",
         )
         auto_relax_on_infeasible = st.checkbox(
-            "Tự nới ràng buộc khi vô nghiệm", value=True,
+            "Nếu không xếp hết môn: tự thử nới ràng buộc ngày ôn tối thiểu",
+            value=True,
         )
 
     with st.expander("Tách môn lớn (tự động)", expanded=True):
         st.caption(
-            "Khi một môn có quá nhiều SV (ví dụ Triết MLN ~4000 SV), bật chế độ này "
-            "để hệ thống chia thành nhiều ca thi khác nhau, mỗi ca dùng đề riêng."
+            "Dùng khi một môn gom quá nhiều sinh viên trong một ca: hệ thống tách thành nhiều ca, "
+            "mỗi ca một đề (ví dụ môn đại trà hàng nghìn người)."
         )
         enable_split = st.checkbox(
-            "Bật tách môn lớn (khuyên dùng cho trường lớn)",
+            "Tách môn quá đông thành nhiều ca (khuyên dùng)",
             value=True,
-            help="Bật để tránh các môn 'siêu lớn' (như Triết MLN ~4000 SV) tạo peak không thể bố trí phòng.",
+            help="Giúp tránh một ca «vỡ» phòng hoặc quá tải giám thị khi một môn có rất nhiều sinh viên.",
         )
         max_exam_size = st.number_input(
-            "Ngưỡng SV tối đa / 1 ca thi",
-            min_value=200, max_value=10000, value=1500, step=100,
+            "Tối đa bao nhiêu sinh viên / một ca thi (sau khi tách)",
+            min_value=200,
+            max_value=10000,
+            value=1500,
+            step=100,
             disabled=not enable_split,
             help=(
-                "Trần cứng: mỗi ca thi không quá số SV này (nhân sự giám thị / vận hành). "
-                "Môn vượt ngưỡng tách nhiều ca (đề riêng), kể cả khi một lớp học phần quá đông. "
-                "1500 là mặc định cân đối; giảm nếu ít phòng."
+                "Giới hạn cứng cho mỗi ca. Môn vượt sẽ bị chia thêm ca. "
+                "1500 là điểm cân bằng mặc định; giảm nếu ít phòng hoặc muốn ca nhỏ hơn."
             ),
         )
 
     with st.expander("Phân bố tải", expanded=True):
         balance_mode = st.radio(
-            "Mục tiêu phân bố",
+            "Ưu tiên khi xếp lịch",
             options=[
-                "Ưu tiên ngày ôn (mặc định)",
-                "Cân bằng tải (trải đều sinh viên theo ngày)",
-                "Cân bằng mạnh (trải đều, có thể tăng vi phạm ngày ôn)",
-                "Nén lịch (dùng ít ngày nhất)",
+                "Ưu tiên nghỉ ôn giữa các môn (mặc định)",
+                "Cân bằng: vừa nghỉ ôn, vừa trải đều số SV theo ngày",
+                "Cân bằng mạnh về số SV/ngày (có thể hy sinh một phần nghỉ ôn)",
+                "Nén lịch: dùng ít ngày nhất có thể",
             ],
             index=0,
             help=(
-                "Ưu tiên ngày ôn: nhiều khoảng nghỉ giữa các môn — có thể dồn đầu/cuối đợt.\n"
-                "Cân bằng: hoà giữa ngày ôn và đều tải theo ngày.\n"
-                "Nén: gom môn vào ít ngày — dễ quá tải phòng."
+                "Mặc định: cố tạo khoảng trống giữa các môn của cùng sinh viên.\n"
+                "Cân bằng: san tải theo ngày.\n"
+                "Nén: ít ngày thi hơn — dễ dồn đông SV một ngày."
             ),
         )
-        if balance_mode.startswith("Cân bằng mạnh"):
+        if "mạnh về số SV" in balance_mode:
             balance_weight = 1.0
-        elif balance_mode.startswith("Cân bằng tải"):
+        elif balance_mode.startswith("Cân bằng:"):
             balance_weight = 0.5
         elif balance_mode.startswith("Nén"):
             balance_weight = 0.05
         else:
             balance_weight = 0.3
         soft_slot_cap_value = st.number_input(
-            "Ngưỡng mềm số SV / ca (0 = tự động theo phòng hoặc 1500)",
+            "Ngưỡng mềm: một ca không nên quá bao nhiêu sinh viên (0 = tự tính)",
             min_value=0,
             value=1500,
             step=100,
             help=(
-                "Phạt mạnh khi một ca có quá nhiều sinh viên. "
-                "0 = tự lấy theo tổng sức chứa phòng (nếu có file phòng), không thì dùng 1500."
+                "Dùng trong điểm phạt khi xếp: ca quá đông sẽ bị «đẩy» sang chỗ khác nếu có thể. "
+                "0 = lấy theo ~95% tổng chỗ ngồi phòng (nếu có file phòng), không thì 1500."
             ),
         )
         lns_iterations = st.slider(
-            "Số vòng cải tiến LNS (giảm vi phạm ngày ôn)",
-            min_value=0, max_value=8, value=3, step=1,
+            "Số vòng sửa lịch cục bộ (LNS)",
+            min_value=0,
+            max_value=8,
+            value=3,
+            step=1,
             help=(
-                "Mỗi vòng thử chuyển khoảng 120 môn vi phạm nhiều nhất sang ô thời gian tốt hơn. "
-                "Ba vòng thường giảm mạnh vi phạm. 0 = tắt bước này."
+                "Mỗi vòng xử lý khoảng 120 môn đang vi phạm nghỉ ôn nặng nhất. "
+                "3 vòng thường đủ; 0 = tắt LNS."
             ),
         )
 
@@ -353,29 +381,30 @@ with st.sidebar:
 up_col1, up_col2 = st.columns(2)
 with up_col1:
     plan_file = st.file_uploader(
-        "1) Kế hoạch thi (Ke_hoach_thi.xlsx) — bắt buộc",
+        "Bước 1 — Kế hoạch thi (Ke_hoach_thi.xlsx)",
         type=["xlsx"],
-        help="Cần có cột 'Ngày BD', 'Ngày kết thúc'.",
+        help="Bắt buộc. Cần cột «Ngày BD» và «Ngày kết thúc» để xác định khung ngày thi.",
     )
     reg_file = st.file_uploader(
-        "2) Danh sách SV đăng ký môn (DSSV_*.xlsx) — bắt buộc",
+        "Bước 2 — Danh sách sinh viên đăng ký (DSSV_*.xlsx)",
         type=["xlsx"],
-        help="Cột: MaHS, TenSV, MalopHP, TenLopHP, SoTC. Tuỳ chọn MaHinhThuc theo bảng mã: 1=Tự luận, 2=Trắc nghiệm, 3=Vấn đáp (nếu trống: suy từ tên môn). "
-        "Ràng buộc lịch: 4 ký tự cuối MalopHP = Khoa_nhom — hai môn khác nhau cùng hậu tố không thi cùng một ngày.",
+        help=(
+            "Bắt buộc. Cột: MaHS, TenSV, MalopHP, TenLopHP, SoTC. "
+            "Tuỳ chọn MaHinhThuc: 1 = tự luận, 2 = trắc nghiệm máy, 3 = vấn đáp (để trống thì suy từ tên môn). "
+            "Quy tắc Khoa_nhom: **4 ký tự cuối** MalopHP — hai môn khác học phần mà trùng hậu tố này không thi cùng một ngày."
+        ),
     )
 with up_col2:
     rooms_file = st.file_uploader(
-        "3) Phòng thi (tuỳ chọn)",
+        "Bước 3 — Danh sách phòng (tuỳ chọn)",
         type=["xlsx"],
         help=(
-            "Mã phòng (RoomID / Phòng…), sức chứa (Capacity / So luong…). "
-            "Tuỳ chọn: khu (Khu / Location); cột mã ghép phòng (RoomType / «Mã ghép hình thức thi») "
-            "dùng cùng bảng với môn thi: 1=Tự luận→ưu tiên phòng lý thuyết, 2=Trắc nghiệm→phòng máy, "
-            "3=Vấn đáp→mọi phòng phù hợp."
+            "Mã phòng (RoomID / Phòng…), sức chứa (Capacity / Số lượng…). "
+            "Tuỳ chọn: khu; cột loại phòng (RoomType / «Mã ghép hình thức thi») dùng mã 1/2/3 giống môn thi."
         ),
     )
     invigilators_file = st.file_uploader(
-        "4) Giám thị (tuỳ chọn)",
+        "Bước 4 — Danh sách giám thị (tuỳ chọn)",
         type=["xlsx"],
         help="Cột: InvigilatorID (mã), FullName (họ tên). Tuỳ chọn: MaxSessionsPerDay, MaxSessionsTotal.",
     )
@@ -499,7 +528,10 @@ if run_btn:
 
 state = st.session_state.get("scheduler_data")
 if not state:
-    st.info("👆 Upload file và bấm **Xếp lịch thi** để bắt đầu.")
+    st.info(
+        "Chọn **hai file bắt buộc** (kế hoạch thi + danh sách đăng ký), tuỳ chọn thêm phòng và giám thị, "
+        "rồi bấm **Xếp lịch thi**."
+    )
     st.stop()
 
 window = state["window"]
@@ -532,27 +564,22 @@ with tabs[0]:
     c2.metric("Sinh viên", f"{result.stats.num_students:,}")
     c3.metric("Ô thời gian đã dùng / tổng", f"{kpi.slots_used} / {result.stats.num_slots}")
     c4.metric(
-        "Vi phạm ngày ôn",
+        "Cặp môn thiếu nghỉ ôn (ước lượng)",
         f"{kpi.prep_violation_count:,}",
         delta=(
-            f"Cùng-ngày: {kpi.same_day_violation_count:,}"
+            f"Trong đó thi cùng ngày: {kpi.same_day_violation_count:,}"
             if kpi.same_day_violation_count
-            else "Không có cùng-ngày"
+            else "Không có trường hợp cùng ngày"
         ),
         delta_color=("inverse" if kpi.same_day_violation_count else "normal"),
         help=(
-            "Cùng-ngày = số cặp môn liên tiếp của SV có 0 ngày ôn (thi cùng ngày). "
-            "Đây là chỉ số đau nhất; nên gần 0 nhất có thể."
+            "Đếm các lần sinh viên thi hai môn liên tiếp mà khoảng nghỉ thực tế nhỏ hơn "
+            "mức «Số ngày nghỉ ôn / tín chỉ» bạn cấu hình. "
+            "«Cùng ngày» là trường hợp nặng nhất (0 ngày nghỉ giữa hai môn)."
         ),
     )
 
-    hard_errs = getattr(kpi, "prep_prefix_hard_errors", None) or []
-    if hard_errs:
-        st.error(
-            "**Lỗi cứng (học phần — 7 ký tự đầu MalopHP):** quá 10% sinh viên của học phần "
-            "không có thời gian ôn trước môn thi (yêu cầu > 0 ngày, thực tế ≤ 0).\n\n"
-            + "\n".join(f"- {msg}" for msg in hard_errs)
-        )
+    _show_hoc_phan_prep_hard_errors(kpi)
 
     c5, c6, c7, c8 = st.columns(4)
     c5.metric("Phương thức giải", hien_thi_phuong_thuc(result.stats.method))
@@ -592,12 +619,7 @@ with tabs[1]:
 
     if diagnose_report.errors:
         st.error("**Vấn đề cứng:**\n\n" + "\n".join(f"- {e}" for e in diagnose_report.errors))
-    hard_errs = getattr(kpi, "prep_prefix_hard_errors", None) or []
-    if hard_errs:
-        st.error(
-            "**Lỗi cứng sau xếp lịch (ngày ôn / học phần 7 ký tự):**\n\n"
-            + "\n".join(f"- {msg}" for msg in hard_errs)
-        )
+    _show_hoc_phan_prep_hard_errors(kpi)
     if diagnose_report.warnings:
         st.warning("**Cảnh báo:**\n\n" + "\n".join(f"- {w}" for w in diagnose_report.warnings))
     if diagnose_report.info:
@@ -616,7 +638,7 @@ with tabs[1]:
     )
     st.dataframe(type_df, use_container_width=True, hide_index=True)
 
-    st.markdown("**Vi phạm ngày ôn (xem nhanh)**")
+    st.markdown("**Danh sách vi phạm nghỉ ôn (tóm tắt)**")
     vios_df = violations_to_dataframe(violations)
     if vios_df.empty:
         st.success("Không có vi phạm ngày ôn.")
@@ -820,8 +842,8 @@ kpi_rows = [
     ("Số sinh viên", result.stats.num_students),
     ("Ô thời gian đã dùng", kpi.slots_used),
     ("Tổng số ô thời gian", result.stats.num_slots),
-    ("Số vi phạm ngày ôn", kpi.prep_violation_count),
-    ("Trong đó vi phạm cùng-ngày (0 ngày ôn)", kpi.same_day_violation_count),
+    ("Số cặp môn thiếu nghỉ ôn (ước lượng)", kpi.prep_violation_count),
+    ("Số cặp thi cùng ngày (0 ngày nghỉ)", kpi.same_day_violation_count),
     ("Số SV bị vi phạm cùng-ngày", kpi.same_day_violation_students),
     ("Khoảng ôn trung bình của các cặp vi phạm (ngày)", round(kpi.avg_prep_gap, 2)),
     ("Khoảng ôn nhỏ nhất ghi nhận (ngày)", round(kpi.min_prep_gap, 2)),
@@ -830,7 +852,7 @@ kpi_rows = [
     ("Cao nhất SV / ca", kpi.max_students_per_slot),
 ]
 for msg in getattr(kpi, "prep_prefix_hard_errors", None) or []:
-    kpi_rows.append(("Lỗi cứng học phần (>10% SV không ôn)", msg))
+    kpi_rows.append(("Cảnh báo học phần: >10% SV thiếu nghỉ ôn", msg))
 
 excel_bytes = to_excel_bytes(schedule_df, vios_df, student_df, kpi_rows)
 st.download_button(

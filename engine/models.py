@@ -102,8 +102,6 @@ class SolveStats:
     num_conflicts: int = 0
     slots_used: int = 0
     days_used: int = 0
-    prep_violations: int = 0
-    pbl_avg_position: float = 0.0  # 0..1; 1 = càng cuối càng tốt
     relaxations: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
 

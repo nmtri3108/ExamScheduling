@@ -218,7 +218,6 @@ def _solve_cpsat(
     model: cp_model.CpModel,
     slot_vars: List[cp_model.IntVar],
     time_limit: float,
-    progress_cb: Optional[Callable[[str], None]] = None,
 ) -> Tuple[int, Optional[List[int]]]:
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = float(max(1.0, time_limit))
@@ -435,7 +434,8 @@ def solve(
                 optimize=True,
                 allowed_slot_domains=cpsat_domains,
             )
-            status, values = _solve_cpsat(model, slot_vars, remaining, progress_cb=lambda _m: progress(75, "Đang chạy tối ưu SAT…"))
+            progress(76, "Đang chạy tối ưu ràng buộc (SAT)…")
+            status, values = _solve_cpsat(model, slot_vars, remaining)
             if values is not None:
                 cpsat_used = True
                 method = f"{method}+cpsat" if method != "greedy" else "greedy+cpsat"
@@ -443,7 +443,7 @@ def solve(
                     final_assignment[exam.exam_id] = values[i]
                 progress(88, f"Tối ưu ràng buộc (SAT) xong: {_trang_thai_cp_sat_vn(status)}.")
             else:
-                progress(85, "Tối ưu SAT không cải thiện thêm, giữ lịch tham lam.")
+                progress(85, "Bước tối ưu ràng buộc (SAT) không cho nghiệm mới — giữ lịch sau tham lam/LNS.")
         except Exception as exc:  # noqa: BLE001
             relaxations.append(f"Lỗi hoặc bỏ qua bước SAT: {exc}")
     elif optimize_objective and not cpsat_eligible:
@@ -498,45 +498,6 @@ def solve(
         stats.notes.append(f"Có {len(greedy.unplaced)} môn chưa đặt được – cần rà soát.")
 
     return SolveResult(scheduled=scheduled, stats=stats, violations=[])
-
-
-# ---------------------------------------------------------------------------
-# Backward-compatible helpers used by app.py
-# ---------------------------------------------------------------------------
-
-def solve_exam_timetable(
-    exams: List[Exam],
-    window: ScheduleWindow,
-    rooms: List[Room],
-    allowed_sessions_by_exam_id: Dict[str, List[int]] | None = None,
-    session_labels: List[str] | None = None,
-    session_half: List[int] | None = None,
-    prep_day_per_credit: float = 0.6,
-    min_prep_days: float = 0.0,
-    max_exams_per_day: int = 2,
-    solver_time_limit_seconds: float = 120.0,
-    optimize_objective: bool = True,
-    fixed_slots: Dict[str, int] | None = None,
-    base_slots: Dict[str, int] | None = None,
-    progress_cb=None,
-) -> SolveResult:
-    """Giữ tương thích chữ ký cũ cho app.py — trả thẳng SolveResult mới."""
-    return solve(
-        exams=exams,
-        window=window,
-        rooms=rooms,
-        allowed_sessions_by_exam_id=allowed_sessions_by_exam_id,
-        session_labels=session_labels,
-        session_half=session_half,
-        prep_day_per_credit=prep_day_per_credit,
-        min_prep_days=min_prep_days,
-        max_exams_per_day=max_exams_per_day,
-        solver_time_limit_seconds=solver_time_limit_seconds,
-        optimize_objective=optimize_objective,
-        fixed_slots=fixed_slots,
-        base_slots=base_slots,
-        progress_cb=progress_cb,
-    )
 
 
 def detect_prep_violations(

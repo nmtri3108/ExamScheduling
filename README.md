@@ -156,10 +156,11 @@ required = max(min_prep_days, max(TC_môn_A, TC_môn_B) × prep_day_per_credit)
 
 1. Bỏ giới hạn sức chứa tổng (phòng xử lý sau)  
 2. Bỏ `max môn/SV/ngày`  
-3. Cho phép trùng SV cùng ca — **vẫn giữ ôn max(TC) + Khoa_nhom + giãn CN (≥3 ngày)**  
-4. Nới **Khoa_nhom** / neo buổi — **vẫn giữ ôn & giãn CN**  
-5. **Ép xếp hết** — chỉ lúc này mới nới ôn/CN, chọn slot ít vi phạm nhất  
-6. Gán khẩn cấp slot 0 nếu thiếu cấu hình ca (hiếm)
+3. Cho phép trùng SV cùng ca — giữ ôn + Khoa_nhom + giãn CN  
+4. Nới **Khoa_nhom** — **vẫn giữ cùng buổi (7 ký tự HP)** + ôn + giãn CN  
+5. **Ép xếp hết** — nới ôn/CN/buổi chỉ khi bắt buộc; chọn slot ít vi phạm nhất  
+6. **Sửa sau greedy** — chuyển ca để giảm ôn/CN  
+7. Gán khẩn cấp slot 0 (hiếm)
 
 **Không** tự chạy lại greedy với `min_prep_days=0` (tránh req=3 mà thực tế 0–1 ngày).
 

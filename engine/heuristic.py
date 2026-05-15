@@ -112,8 +112,8 @@ def schedule_greedy(
     if weekend_large_course_min_students > 0 and not prefix_tot:
         prefix_tot = build_prefix_student_totals(exams)
     weekday_relax_logged = False
-    # Cùng 7 ký tự mã học phần (MalopHP) → các ca tách phải cùng một buổi (sáng/chiều).
-    prefix_anchor: Dict[str, Tuple[int, int]] = {}
+    # Cùng 7 ký tự HP: các ca tách cùng buổi (0=sáng, 1=chiều); có thể khác ngày.
+    prefix_half_anchor: Dict[str, int] = {}
 
     # Khoa_nhom = 4 ký tự cuối MalopHP: hai môn khác nhau cùng hậu tố không cùng ngày
     # (trừ ca tách cùng học phần — same_course_khoa_nhom_waiver).
@@ -124,15 +124,24 @@ def schedule_greedy(
     exam_wave = [exam_cohort_wave_index(exams[i], global_max_cohort) for i in range(n)]
 
     def _flatten_pending_by_wave(pending: List[int]) -> List[int]:
-        """Giữ nguyên thứ tự sóng (khóa mới trước); trong mỗi sóng: priority → bậc → quy mô."""
+        """Sóng khóa trước; trong sóng gom theo 7 ký tự HP để ca tách cùng buổi."""
         buckets: Dict[int, List[int]] = defaultdict(list)
         for idx in pending:
             buckets[exam_wave[idx]].append(idx)
         out: List[int] = []
         for w in sorted(buckets.keys()):
-            grp = buckets[w]
-            grp.sort(key=lambda i: (-exams[i].priority, -len(adj[i]), -exams[i].size, i))
-            out.extend(grp)
+            by_pfx: Dict[str, List[int]] = defaultdict(list)
+            for idx in buckets[w]:
+                pfx = str(exams[idx].course_prefix_7 or "").strip() or f"__{idx}"
+                by_pfx[pfx].append(idx)
+            pfx_keys = sorted(
+                by_pfx.keys(),
+                key=lambda p: (-sum(exams[i].size for i in by_pfx[p]), p),
+            )
+            for pfx in pfx_keys:
+                sub = by_pfx[pfx]
+                sub.sort(key=lambda i: (-exams[i].priority, -len(adj[i]), -exams[i].size, i))
+                out.extend(sub)
         return out
 
     day_khoa_registry: Dict[Tuple[int, str], List[int]] = defaultdict(list)
@@ -172,8 +181,8 @@ def schedule_greedy(
             sess = slot % window.sessions_per_day
             h = int(session_half[sess]) if sess < len(session_half) else 0
             pfx = exam.course_prefix_7
-            if pfx not in prefix_anchor:
-                prefix_anchor[pfx] = (day, h)
+            if pfx not in prefix_half_anchor:
+                prefix_half_anchor[pfx] = h
         for k in kko:
             day_khoa_registry[(day, k)].append(idx)
 
@@ -279,11 +288,9 @@ def schedule_greedy(
         if not ignore_prefix_anchor and session_half and exam.course_prefix_7:
             sess = slot % window.sessions_per_day
             h = int(session_half[sess]) if sess < len(session_half) else 0
-            anchor = prefix_anchor.get(exam.course_prefix_7)
-            if anchor is not None:
-                ad, ah = anchor
-                if day != ad or h != ah:
-                    return False
+            ah = prefix_half_anchor.get(exam.course_prefix_7)
+            if ah is not None and h != ah:
+                return False
         if not ignore_khoa_nhom:
             keys = exam_khoa_keys[idx]
             if keys:
@@ -305,8 +312,8 @@ def schedule_greedy(
         if session_half and exam.course_prefix_7:
             h = int(session_half[sess]) if sess < len(session_half) else 0
             pfx = exam.course_prefix_7
-            if pfx not in prefix_anchor:
-                prefix_anchor[pfx] = (day, h)
+            if pfx not in prefix_half_anchor:
+                prefix_half_anchor[pfx] = h
         for sid in exam.student_ids:
             slot_used_students[slot].add(sid)
             day_exams_per_student[(sid, day)] += 1
@@ -318,6 +325,80 @@ def schedule_greedy(
             day_khoa_registry[(day, k)].append(idx)
         if weekday_at_day_index(window, day) == 6:
             sunday_exam_days.add(day)
+
+    def _uncommit(idx: int) -> Optional[int]:
+        """Gỡ ca đã đặt (phục vụ sửa ôn / đổi slot)."""
+        exam = exams[idx]
+        eid = exam.exam_id
+        slot = assignment.pop(eid, None)
+        if slot is None:
+            return None
+        day, _ = _slot_to_day_session(slot, window.sessions_per_day)
+        spd = window.sessions_per_day
+        for sid in exam.student_ids:
+            slot_used_students[slot].discard(sid)
+            key = (sid, day)
+            day_exams_per_student[key] -= 1
+            if day_exams_per_student[key] <= 0:
+                del day_exams_per_student[key]
+            olist = student_day_exams[sid].get(day, [])
+            student_day_exams[sid][day] = [i for i in olist if i != idx]
+            if not student_day_exams[sid][day]:
+                del student_day_exams[sid][day]
+            if not student_day_exams[sid]:
+                del student_day_exams[sid]
+        slot_load_students[slot] -= exam.size
+        day_load_students[day] -= exam.size
+        for k in exam_khoa_keys[idx]:
+            reg = day_khoa_registry.get((day, k), [])
+            day_khoa_registry[(day, k)] = [i for i in reg if i != idx]
+        if weekday_at_day_index(window, day) == 6:
+            if not any(s // spd == day for s in assignment.values()):
+                sunday_exam_days.discard(day)
+        return int(slot)
+
+    def _greedy_repair_prep(rounds: int = 2) -> int:
+        """Thử chuyển ca sang slot khác để giảm điểm phạt ôn/CN (sau khi đã xếp hết)."""
+        moved = 0
+        fixed_set = set(fixed_slots.keys())
+        for _ in range(rounds):
+            candidates = [
+                i
+                for i in range(n)
+                if exams[i].exam_id in assignment and exams[i].exam_id not in fixed_set
+            ]
+            candidates.sort(
+                key=lambda i: -_score_slot(i, assignment[exams[i].exam_id])
+            )
+            for idx in candidates:
+                eid = exams[idx].exam_id
+                old_slot = assignment[eid]
+                old_pen = _score_slot(idx, old_slot)
+                if _uncommit(idx) is None:
+                    continue
+                allowed = _slots_for_exam(idx, relax_weekday=True)
+                best_slot = old_slot
+                best_pen = old_pen
+                for slot in allowed:
+                    if not _try_place(
+                        idx,
+                        slot,
+                        allow_conflict=False,
+                        ignore_capacity=True,
+                        ignore_per_day=True,
+                        ignore_credit_prep=False,
+                    ):
+                        continue
+                    pen = _score_slot(idx, slot)
+                    if pen < best_pen - 1e-6:
+                        best_pen = pen
+                        best_slot = slot
+                if best_slot != old_slot:
+                    _commit(idx, best_slot)
+                    moved += 1
+                else:
+                    _commit(idx, old_slot)
+        return moved
 
     def _score_slot(idx: int, slot: int) -> float:
         """Càng thấp càng tốt. Tổng hợp 5 thành phần điểm:
@@ -391,9 +472,9 @@ def schedule_greedy(
                                 same_day_count += 1
             scale = len(exam.student_ids) / max(1, len(sample))
             spread_w = max(0.01, float(spread_prep_factor))
-            score += deficit_sq_sum * scale * 0.12 * spread_w * prep_w
-            score += high_credit_pen * scale * 0.08 * spread_w * prep_w
-            score += same_day_count * scale * 1.2 * spread_w * prep_w
+            score += deficit_sq_sum * scale * 0.20 * spread_w * prep_w
+            score += high_credit_pen * scale * 0.12 * spread_w * prep_w
+            score += same_day_count * scale * 2.0 * spread_w * prep_w
 
         # (4) Giữ gần base_slots khi repair
         prev = base_slots.get(exam.exam_id)
@@ -431,13 +512,15 @@ def schedule_greedy(
         ignore_prefix: bool,
     ) -> Optional[int]:
         """Chọn slot ép cuối: ưu tiên còn ôn/CN cứng, rồi mới nới; luôn minimize _score_slot."""
-        tiers = (
-            (False, False),
-            (False, True),
-            (True, False),
-            (True, True),
-        )
-        for ignore_prep, ignore_sunday in tiers:
+        tiers: List[Tuple[bool, bool, bool]] = [
+            (False, False, False),
+            (False, True, False),
+            (True, False, False),
+            (True, True, False),
+        ]
+        if not ignore_prefix:
+            tiers.append((True, True, True))
+        for ignore_prep, ignore_sunday, ignore_pfx in tiers:
             best_slot: Optional[int] = None
             best_pen = float("inf")
             for slot in allowed:
@@ -449,7 +532,7 @@ def schedule_greedy(
                     ignore_per_day=True,
                     ignore_credit_prep=ignore_prep,
                     ignore_khoa_nhom=ignore_khoa,
-                    ignore_prefix_anchor=ignore_prefix,
+                    ignore_prefix_anchor=ignore_pfx,
                     ignore_sunday_spread=ignore_sunday,
                 ):
                     continue
@@ -626,25 +709,25 @@ def schedule_greedy(
             force_if_needed=False,
         )
 
-    # 5) Nới Khoa_nhom + cùng buổi — vẫn GIỮ ôn + giãn CN (không nới ôn sớm)
+    # 5) Nới Khoa_nhom — vẫn giữ cùng buổi (7 ký tự HP) + ôn + giãn CN
     if leftover:
         relaxations.append(
-            f"Nới Khoa_nhom / cùng buổi cho {len(leftover)} môn — vẫn giữ ngày ôn & giãn Chủ nhật."
+            f"Nới Khoa_nhom cho {len(leftover)} môn — vẫn giữ cùng buổi HP, ngày ôn & giãn CN."
         )
         leftover = _place_leftover_loop(
             list(leftover),
             allow_conflict=True,
             ignore_credit_prep=False,
             ignore_khoa=True,
-            ignore_prefix=True,
+            ignore_prefix=False,
             force_if_needed=False,
         )
 
-    # 6) Bắt buộc 100% môn — chỉ lúc này mới nới ôn/CN, chọn slot ít vi phạm nhất
+    # 6) Bắt buộc 100% môn — nới ôn/CN/buổi chỉ khi không còn chỗ
     if leftover:
         n_force = len(leftover)
         relaxations.append(
-            f"Đặt bắt buộc {n_force} môn còn lại — ưu tiên slot ít vi phạm ôn/CN nhất."
+            f"Đặt bắt buộc {n_force} môn còn lại — ưu tiên slot ít vi phạm ôn/CN/buổi nhất."
         )
         weekday_relax_logged = True
         leftover = _place_leftover_loop(
@@ -652,7 +735,7 @@ def schedule_greedy(
             allow_conflict=True,
             ignore_credit_prep=False,
             ignore_khoa=True,
-            ignore_prefix=True,
+            ignore_prefix=False,
             force_if_needed=True,
         )
 
@@ -667,6 +750,12 @@ def schedule_greedy(
                 _force_commit(idx, int(fixed_slots[eid]))
             else:
                 _force_commit(idx, 0)
+
+    repaired = _greedy_repair_prep(rounds=3)
+    if repaired > 0:
+        relaxations.append(
+            f"Sửa sau greedy: đã chuyển {repaired} ca để giảm vi phạm ôn/CN (giữ cùng buổi HP)."
+        )
 
     unplaced = [e.exam_id for e in exams if e.exam_id not in assignment]
     return HeuristicResult(assignment=assignment, unplaced=unplaced, relaxations=relaxations)
@@ -775,23 +864,20 @@ def lns_improve(
         return 0
 
     def _prefix_feasible(eid: str, slot: int) -> bool:
+        """Cùng 7 ký tự HP → cùng buổi (sáng/chiều); được khác ngày."""
         ex = exams[exam_index[eid]]
         pfx = ex.course_prefix_7
         if not session_half or not pfx:
             return True
-        day = slot // sessions_per_day
         h = _half_of(slot)
-        siblings = [
-            e2
-            for e2 in current
-            if e2 != eid and exams[exam_index[e2]].course_prefix_7 == pfx
-        ]
-        if not siblings:
-            return True
-        ref = siblings[0]
-        rd = current[ref] // sessions_per_day
-        rh = _half_of(current[ref])
-        return day == rd and h == rh
+        for e2 in current:
+            if e2 == eid:
+                continue
+            if exams[exam_index[e2]].course_prefix_7 != pfx:
+                continue
+            if _half_of(current[e2]) != h:
+                return False
+        return True
 
     # Build per-student exam list
     student_to_exams: Dict[str, List[str]] = defaultdict(list)

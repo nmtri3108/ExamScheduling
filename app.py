@@ -110,7 +110,7 @@ def _run_pipeline(
     optimize,
     balance_weight=1.0,
     soft_slot_cap=0,
-    lns_iterations=3,
+    lns_iterations=4,
     fixed_slots=None,
     base_slots=None,
     auto_relax=True,
@@ -347,11 +347,11 @@ with st.sidebar:
             "Số vòng sửa lịch cục bộ (LNS)",
             min_value=0,
             max_value=8,
-            value=3,
+            value=4,
             step=1,
             help=(
                 "Mỗi vòng xử lý khoảng 120 môn đang vi phạm nghỉ ôn nặng nhất. "
-                "3 vòng thường đủ; 0 = tắt LNS."
+                "4 vòng khuyến nghị; 0 = tắt LNS."
             ),
         )
 

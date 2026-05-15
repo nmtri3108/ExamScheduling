@@ -179,6 +179,7 @@ def _run_pipeline(
         exams=exams,
         student_name_map=student_name_map,
         prep_day_per_credit=float(prep_day_per_credit),
+        min_prep_days=float(min_prep_days),
     )
     kpi = compute_kpi(result.scheduled, exams, window, violations)
     progress_bar.progress(100, text="Hoàn tất!")
@@ -277,8 +278,12 @@ with st.sidebar:
             help="LNS: sửa cục bộ, thường rất hữu ích. SAT: chỉ chạy khi số môn và xung đột nằm trong ngưỡng an toàn.",
         )
         auto_relax_on_infeasible = st.checkbox(
-            "Nếu không xếp hết môn: tự thử nới ràng buộc ngày ôn tối thiểu",
+            "Ghi chú khi không xếp hết môn (không tự bỏ ngày ôn toàn cục)",
             value=True,
+            help=(
+                "Nếu vẫn còn môn chưa đặt sau bước tham lam, chỉ ghi log gợi ý — "
+                "không chạy lại với min_prep_days=0 (tránh làm vỡ ngày ôn theo tín chỉ)."
+            ),
         )
 
     with st.expander("Tách môn lớn (tự động)", expanded=True):

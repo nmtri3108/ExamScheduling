@@ -278,6 +278,54 @@ def exam_max_cohort_index(exam: Exam) -> int:
     return mx
 
 
+def prep_days_required_for_exam(
+    exam: Exam,
+    prep_day_per_credit: float,
+    min_prep_days: float = 0.0,
+) -> float:
+    """Số ngày ôn mong muốn cho một môn (khớp báo cáo vi phạm — môn «sau»)."""
+    return max(float(min_prep_days), float(exam.credits) * float(prep_day_per_credit))
+
+
+def prep_days_required_for_pair(
+    exam_a: Exam,
+    exam_b: Exam,
+    prep_day_per_credit: float,
+    min_prep_days: float = 0.0,
+) -> float:
+    """Khoảng ôn tối thiểu giữa hai môn cùng SV — dùng max tín chỉ để không «thiệt» môn 4+ TC."""
+    cred = max(float(exam_a.credits), float(exam_b.credits))
+    return max(float(min_prep_days), cred * float(prep_day_per_credit))
+
+
+def min_calendar_gap_days_between_exams(
+    exam_a: Exam,
+    exam_b: Exam,
+    prep_day_per_credit: float,
+    min_prep_days: float = 0.0,
+) -> int:
+    """Số ngày lịch tối thiểu giữa hai ngày thi (|day1-day2| phải ≥ giá trị này)."""
+    req = prep_days_required_for_pair(exam_a, exam_b, prep_day_per_credit, min_prep_days)
+    if req <= 0:
+        return 0
+    return int(ceil(req))
+
+
+def exam_cohort_wave_index(exam: Exam, global_max_cohort: int) -> int:
+    """Sóng xếp lịch: 0 = khóa mới nhất trong đợt (≈ năm 1), tăng dần theo khóa cũ hơn.
+
+    Hai chữ số đầu của 4 ký tự cuối MalopHP được coi là mã khóa nhập học (vd 25, 22).
+    `global_max_cohort` = max trên toàn bộ ca thi; ca có max=25 xếp trước ca có max=22.
+    Malop không đọc được khóa (0) → sóng cuối để không chặn các ca khác.
+    """
+    mx = exam_max_cohort_index(exam)
+    if mx <= 0:
+        return 1_000_000
+    if global_max_cohort <= 0:
+        return 0
+    return int(global_max_cohort) - int(mx)
+
+
 def same_course_khoa_nhom_waiver(e1: Exam, e2: Exam) -> bool:
     """Cùng học phần (ca tách đề / cùng mã) — không áp lệnh «khác ngày theo Khoa_nhom» giữa các ca."""
     a = (e1.course_prefix_7 or "").strip()
@@ -333,8 +381,13 @@ def build_prefix_student_totals(exams: List[Exam]) -> Dict[str, int]:
     return {k: len(v) for k, v in by_pfx.items()}
 
 
-def _weekday_at_day_index(window: ScheduleWindow, day_idx: int) -> int:
+def weekday_at_day_index(window: ScheduleWindow, day_idx: int) -> int:
+    """Thứ trong tuần của ô ngày `day_idx` (0=Thứ Hai … 6=Chủ nhật)."""
     return (window.start_date + timedelta(days=int(day_idx))).weekday()
+
+
+def _weekday_at_day_index(window: ScheduleWindow, day_idx: int) -> int:
+    return weekday_at_day_index(window, day_idx)
 
 
 def day_allowed_for_exam_weekday_rule(
@@ -349,7 +402,7 @@ def day_allowed_for_exam_weekday_rule(
         return True
     pfx = _malop_prefix_7_for_exam(exam)
     n = prefix_totals.get(pfx, 0)
-    wd = _weekday_at_day_index(window, day_idx)
+    wd = weekday_at_day_index(window, day_idx)
     if n >= weekend_large_min_students:
         return wd in (5, 6)
     return wd != 6

@@ -25,7 +25,8 @@ from .diagnostics import (
     exam_khoa_nhom_keys,
     same_course_khoa_nhom_waiver,
 )
-from .heuristic import HeuristicResult, heuristic_to_scheduled, lns_improve, schedule_greedy
+from .diagnostics import prep_days_required_for_pair
+from .heuristic import HeuristicResult, lns_improve, schedule_greedy
 from .models import (
     Exam,
     Invigilator,
@@ -144,7 +145,16 @@ def _build_cpsat_model(
     if optimize and prep_day_per_credit > 0 and conflicts:
         sorted_pairs = sorted(conflicts.items(), key=lambda kv: -kv[1])[:top_k_prep_pairs]
         for (i, j), overlap in sorted_pairs:
-            req = int(ceil(max(min_prep_days, min(exams[i].credits, exams[j].credits) * prep_day_per_credit)))
+            # Dùng max tín chỉ của cặp để không "thiệt" môn 4+ tín chỉ khi cặp với môn ít tín chỉ.
+            # (Thực tế báo cáo vi phạm cũng tính theo môn "sau", thường là môn cần ôn nhiều hơn.)
+            req = int(
+                ceil(
+                    max(
+                        min_prep_days,
+                        max(float(exams[i].credits), float(exams[j].credits)) * prep_day_per_credit,
+                    )
+                )
+            )
             if req <= 0:
                 continue
             diff = model.NewIntVar(-total_days, total_days, f"sp_d_{i}_{j}")
@@ -306,31 +316,12 @@ def solve(
     )
     relaxations.extend(greedy.relaxations)
 
-    # Auto-relax nếu greedy còn unplaced: thử bỏ min_prep_days và max_exams_per_day
+    # Không chạy lại greedy với min_prep_days=0 — dễ tạo hàng nghìn vi phạm prep (req=3, thực tế=0–1).
     if greedy.unplaced and auto_relax:
-        if min_prep_days > 0:
-            progress(25, "Đang nới ràng buộc số ngày ôn tối thiểu về 0 và chạy lại bước tham lam…")
-            relaxed = schedule_greedy(
-                exams=exams,
-                window=window,
-                allowed_sessions_by_exam_id=allowed_sessions_by_exam_id,
-                max_exams_per_day=max_exams_per_day,
-                min_prep_days=0,
-                prep_day_per_credit=prep_day_per_credit,
-                total_capacity=total_capacity,
-                fixed_slots=fixed_slots,
-                base_slots=base_slots,
-                balance_weight=balance_weight,
-                soft_slot_cap=soft_slot_cap,
-                session_half=session_half,
-                weekend_large_course_min_students=weekend_large_course_min_students,
-                prefix_student_totals=prefix_totals,
-                spread_prep_factor=spread_prep_factor,
-            )
-            if len(relaxed.unplaced) < len(greedy.unplaced):
-                relaxations.append("Đã nới ràng buộc số ngày ôn tối thiểu về 0 ở bước tham lam.")
-                greedy = relaxed
-                relaxations.extend(relaxed.relaxations)
+        relaxations.append(
+            f"Còn {len(greedy.unplaced)} môn chưa xếp sau nới trong bước tham lam — "
+            "cân nhắc mở rộng đợt thi hoặc giảm max môn/SV/ngày (không tự bỏ ngày ôn toàn cục)."
+        )
 
     progress(45, f"Bước tham lam xong: đã đặt {len(greedy.assignment)}/{len(exams)} môn.")
 
@@ -355,7 +346,6 @@ def solve(
                 prep_day_per_credit=prep_day_per_credit,
                 iterations=lns_iterations,
                 pool_size=lns_pool_size,
-                balance_weight=balance_weight,
                 soft_slot_cap=soft_slot_cap,
                 fixed_slots=fixed_slots,
                 session_half=session_half,
@@ -479,7 +469,7 @@ def solve(
     elapsed_total = time.time() - start_time
     stats = SolveStats(
         method=method,
-        feasible=len(greedy.unplaced) == 0,
+        feasible=len(scheduled) == len(exams),
         elapsed_seconds=elapsed_total,
         num_exams=len(exams),
         num_students=len({sid for e in exams for sid in e.student_ids}),
@@ -489,13 +479,20 @@ def solve(
         days_used=len({s.exam_date for s in scheduled}),
         relaxations=list(dict.fromkeys(relaxations)),
         notes=[
+            "Bước tham lam: sóng khóa (MalopHP) — khóa mới nhất trong đợt xếp trước, khóa cũ sau "
+            "(tương đương ưu tiên sinh viên năm thấp / ít môn chồng lịch trước).",
             f"Bước tham lam đã đặt {len(greedy.assignment)}/{len(exams)} môn.",
             *lns_logs,
             ("Đã chạy thêm bước tối ưu SAT." if cpsat_used else "Không chạy bước SAT (đủ tốt hoặc hết thời gian)."),
         ],
     )
     if greedy.unplaced:
-        stats.notes.append(f"Có {len(greedy.unplaced)} môn chưa đặt được – cần rà soát.")
+        stats.notes.append(
+            f"CẢNH BÁO: {len(greedy.unplaced)} môn vẫn chưa có slot — "
+            "kiểm tra file kế hoạch / cấu hình ca thi."
+        )
+    else:
+        stats.notes.append("Đã xếp đủ 100% môn (có thể đã nới một số ràng buộc — xem log relaxations).")
 
     return SolveResult(scheduled=scheduled, stats=stats, violations=[])
 
@@ -505,6 +502,7 @@ def detect_prep_violations(
     exams: List[Exam],
     student_name_map: Dict[str, str],
     prep_day_per_credit: float = 0.6,
+    min_prep_days: float = 0.0,
 ) -> List[PrepViolation]:
     exam_by_id = {e.exam_id: e for e in exams}
     student_exams = defaultdict(list)
@@ -519,8 +517,14 @@ def detect_prep_violations(
         for i in range(1, len(ordered)):
             prev_date, prev_exam_id = ordered[i - 1]
             curr_date, curr_exam_id = ordered[i]
+            prev_exam = exam_by_id[prev_exam_id]
             curr_exam = exam_by_id[curr_exam_id]
-            required = round(curr_exam.credits * prep_day_per_credit, 2)
+            required = round(
+                prep_days_required_for_pair(
+                    prev_exam, curr_exam, prep_day_per_credit, min_prep_days
+                ),
+                2,
+            )
             actual = (curr_date - prev_date).days
             if actual + 1e-9 < required:
                 violations.append(

@@ -9,6 +9,23 @@ from .i18n import hien_thi_loai_hinh
 from .models import Exam, PrepViolation, ScheduledExam
 
 
+def _student_room_and_split_code(item: ScheduledExam, sid: str) -> tuple[str, str]:
+    """Phòng vật lý và mã ghép cho một SV khi đã chia nhóm theo phòng."""
+    groups = getattr(item, "room_student_groups", None) or []
+    codes = getattr(item, "room_split_codes", None) or []
+    rids = list(item.room_ids or [])
+    if groups and rids and len(groups) == len(rids):
+        for gi, grp in enumerate(groups):
+            if sid in grp:
+                rid = rids[gi] if gi < len(rids) else ""
+                code = codes[gi] if gi < len(codes) else ""
+                return rid, code
+    if rids:
+        c0 = codes[0] if codes else ""
+        return rids[0], c0
+    return "", ""
+
+
 def _exam_malophp_cell(exam: Exam | None) -> str:
     """Chuỗi MalopHP xuất Excel — giữ nguyên mã lớp học phần từ đăng ký (có thể nhiều lớp, cách nhau bởi dấu phẩy)."""
     if exam is None:
@@ -30,6 +47,7 @@ def schedule_to_dataframe(
         pfx7 = str(getattr(ex, "course_prefix_7", "") or "") if ex else ""
         pri = int(ex.priority) if ex else None
         malop = _exam_malophp_cell(ex)
+        codes = list(getattr(s, "room_split_codes", None) or [])
         rows.append(
             {
                 "Ma_ca_thi": s.exam_id,
@@ -43,6 +61,7 @@ def schedule_to_dataframe(
                 "Ngay_thi": s.exam_date.isoformat(),
                 "So_ca": s.session,
                 "Ky_hieu_ca": getattr(s, "session_label", ""),
+                "Ma_phong_chia": ", ".join(codes) if codes else "",
                 "Phong": ", ".join(s.room_ids),
                 "Giam_thi": ", ".join(s.invigilator_ids),
             }
@@ -80,6 +99,8 @@ def student_view_dataframe(
         if not exam:
             continue
         for sid in exam.student_ids:
+            rid, split_code = _student_room_and_split_code(item, sid)
+            phong_cell = rid if rid else ", ".join(item.room_ids)
             rows.append(
                 {
                     "Ma_sinh_vien": sid,
@@ -96,7 +117,8 @@ def student_view_dataframe(
                     "Ngay_thi": item.exam_date.isoformat(),
                     "So_ca": item.session,
                     "Ky_hieu_ca": getattr(item, "session_label", ""),
-                    "Phong": ", ".join(item.room_ids),
+                    "Ma_phong_chia": split_code,
+                    "Phong": phong_cell,
                 }
             )
     df = pd.DataFrame(rows)
@@ -112,6 +134,7 @@ def exam_view_dataframe(scheduled: List[ScheduledExam], exams: List[Exam]) -> pd
         exam = exam_map.get(item.exam_id)
         if not exam:
             continue
+        codes = list(getattr(item, "room_split_codes", None) or [])
         rows.append(
             {
                 "Ma_ca_thi": item.exam_id,
@@ -130,6 +153,7 @@ def exam_view_dataframe(scheduled: List[ScheduledExam], exams: List[Exam]) -> pd
                 "So_lop": len(exam.section_ids),
                 "Danh_sach_lop": ", ".join(exam.section_ids[:5])
                 + ("..." if len(exam.section_ids) > 5 else ""),
+                "Ma_phong_chia": ", ".join(codes) if codes else "",
                 "Phong": ", ".join(item.room_ids),
                 "Giam_thi": ", ".join(item.invigilator_ids),
             }

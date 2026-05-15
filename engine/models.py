@@ -76,6 +76,9 @@ class ScheduledExam:
     session_label: str = ""
     room_ids: List[str] = field(default_factory=list)
     invigilator_ids: List[str] = field(default_factory=list)
+    # Cùng thứ tự room_ids: nhóm sinh viên từng phòng & mã ghép theo quy ước nghiệp vụ.
+    room_student_groups: List[List[str]] = field(default_factory=list)
+    room_split_codes: List[str] = field(default_factory=list)
 
 
 @dataclass

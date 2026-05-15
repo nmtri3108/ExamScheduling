@@ -14,11 +14,54 @@ của mã phòng (RoomID), ví dụ B101 và B205 cùng khu «B».
 from __future__ import annotations
 
 import math
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Set, Tuple
 
 from .models import Exam, Invigilator, Room, ScheduledExam
+
+
+def format_ma_phong_chia(
+    course_prefix_7: str,
+    session_label: str,
+    session_1based: int,
+    room_seq_1based: int,
+) -> str:
+    """Ghép mã phòng/ca theo quy ước: 7 ký tự đầu học phần + ký hiệu ca (bỏ gạch dưới) + STT phòng 2 số.
+
+    Ví dụ: ``1012107`` + ca ``C1`` + phòng thứ 1 → ``1012107C101`` (tương đương ``1012107_C1_01``).
+    """
+    pfx = str(course_prefix_7 or "").strip()
+    if len(pfx) < 7:
+        pfx = (pfx + "0" * 7)[:7]
+    else:
+        pfx = pfx[:7]
+    raw = str(session_label or "").strip()
+    compact = re.sub(r"[_\s\-.]+", "", raw)
+    if not compact:
+        compact = f"S{int(session_1based)}"
+    seq = max(1, int(room_seq_1based))
+    return f"{pfx}{compact}{seq:02d}"
+
+
+def _partition_students_across_rooms(student_ids: List[str], assigned: List[Room]) -> List[List[str]]:
+    """Chia SV đã sắp xếp theo mã vào từng phòng theo sức chứa; phòng cuối nhận phần dư."""
+    students = sorted(str(s) for s in student_ids)
+    if not assigned:
+        return []
+    n = len(assigned)
+    groups: List[List[str]] = [[] for _ in range(n)]
+    idx = 0
+    for ri in range(n):
+        cap = max(1, int(assigned[ri].capacity))
+        if ri == n - 1:
+            groups[ri] = students[idx:]
+            break
+        take = min(cap, len(students) - idx)
+        groups[ri] = students[idx : idx + take]
+        idx += take
+    return groups
 
 
 _THEORY_TYPES = frozenset(
@@ -208,6 +251,14 @@ def assign_rooms_and_invigilators(
             for r in assigned:
                 used_ids.add(r.room_id)
             sched_exam.room_ids = [r.room_id for r in assigned]
+            groups = _partition_students_across_rooms(exam.student_ids, assigned)
+            sched_exam.room_student_groups = groups
+            sess_lbl = str(getattr(sched_exam, "session_label", "") or "")
+            sess_no = int(getattr(sched_exam, "session", 1) or 1)
+            pfx7 = str(getattr(exam, "course_prefix_7", "") or "")
+            sched_exam.room_split_codes = [
+                format_ma_phong_chia(pfx7, sess_lbl, sess_no, ri + 1) for ri in range(len(assigned))
+            ]
             for r in assigned:
                 report.room_usage[r.room_id] = report.room_usage.get(r.room_id, 0) + 1
 

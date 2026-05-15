@@ -3,8 +3,9 @@
 Phần mềm xếp lịch thi cho trường đại học hệ tín chỉ, hỗ trợ cán bộ phòng đào tạo:
 xếp lịch nhanh – đúng ràng buộc – tự tách môn lớn – tự repair khi đổi lịch thủ công.
 
-> **Phiên bản v3 (2026-05)** — pipeline: **Diagnose → Greedy (khóa ưu tiên, Khoa_nhom, load-balance, soft-cap) → LNS → CP-SAT polish.**  
-> Chi tiết nghiệp vụ và ràng buộc: [mục 3 — Logic xếp lịch & nghiệp vụ](#3-logic-xếp-lịch--nghiệp-vụ).
+> **Phiên bản v3.1 (2026-05)** — pipeline: **Diagnose → Greedy (sóng khóa, Khoa_nhom, ôn theo cặp TC, Sunday-spread) → LNS → CP-SAT (nếu đủ nhỏ).**  
+> Data lớn thường chỉ tới **Greedy + LNS**; SAT tự tắt khi vượt ngưỡng.  
+> Chi tiết: [mục 3 — Logic xếp lịch & nghiệp vụ](#3-logic-xếp-lịch--nghiệp-vụ).
 
 ---
 
@@ -132,28 +133,72 @@ Phần này mô tả **đúng hành vi hiện tại** của app (Streamlit `app.
 |---|---|---|
 | Tiền tố học phần | **7 ký tự đầu** `MalopHP` | Gom «môn đông» theo ngưỡng SV; các **ca tách cùng học phần** phải cùng **buổi** (sáng/chiều) khi bật tách đề. |
 | **Khoa_nhom** | **4 ký tự cuối** `MalopHP` | Hai **học phần khác nhau** có cùng hậu tố → **không thi cùng một ngày** (cứng: Greedy, LNS, CP-SAT). **Miễn** giữa các ca **cùng học phần** (cùng 7 ký tự đầu hoặc cùng `CourseID`). |
-| **Chỉ số khóa (ưu tiên xếp)** | **2 ký tự đầu** của 4 ký tự cuối, phải là chữ số (vd `2510` → `25`) | Trên mỗi ca lấy **max** theo mọi MalopHP của ca: số **càng lớn** → xếp **trước** trong Greedy để chiếm slot tốt hơn (ưu tiên SV khóa mới / ít môn). |
+| **Chỉ số khóa (sóng xếp)** | **2 ký tự đầu** của 4 ký tự cuối, phải là chữ số (vd `2510` → `25`) | Greedy xếp theo **sóng**: hết khóa mới nhất trong đợt (≈ năm 1, mã lớn) rồi mới tới khóa cũ; trong sóng: `priority` → bậc xung đột → quy mô SV. |
 
-### 3.3 Tách môn lớn và trần SV mỗi ca
+### 3.3 Ngày ôn (prep-day) — một quy tắc thống nhất
+
+Các tham số sidebar (**không hardcode** `0.6` — đó chỉ là giá trị mặc định):
+
+| Tham số | Công thức |
+|---|---|
+| `prep_day_per_credit` | Hệ số ngày ôn / 1 tín chỉ (mặc định 0.6) |
+| `min_prep_days` | Sàn ngày ôn tối thiểu (mặc định 0 = tắt; đặt 1 → ép thêm khoảng cách tối thiểu) |
+
+**Khoảng ôn giữa hai môn cùng SV** (Greedy cứng, LNS, báo cáo vi phạm, SAT soft):
+
+```
+required = max(min_prep_days, max(TC_môn_A, TC_môn_B) × prep_day_per_credit)
+```
+
+→ Môn **4 TC** cặp với môn 3 TC vẫn tính theo **4 TC** (tránh chỉ còn 1 ngày ôn như khi chỉ lấy TC môn sau).
+
+**Greedy — nới dần khi chật** (ghi trong log `relaxations`):
+
+1. Bỏ giới hạn sức chứa tổng (phòng xử lý sau)  
+2. Bỏ `max môn/SV/ngày`  
+3. Cho phép trùng SV cùng ca — **vẫn giữ ôn max(TC) + Khoa_nhom + giãn CN (≥3 ngày)**  
+4. Nới **Khoa_nhom** / neo buổi — **vẫn giữ ôn & giãn CN**  
+5. **Ép xếp hết** — chỉ lúc này mới nới ôn/CN, chọn slot ít vi phạm nhất  
+6. Gán khẩn cấp slot 0 nếu thiếu cấu hình ca (hiếm)
+
+**Không** tự chạy lại greedy với `min_prep_days=0` (tránh req=3 mà thực tế 0–1 ngày).
+
+**Sunday-spread:** Môn thi **Chủ nhật** (thường môn đông) → môn khác **có SV trùng** phải cách **≥3 ngày** (cứng trong greedy/LNS; chỉ nới ở bước ép cuối). Vd Vật lý CN → Giải tích không dính Thứ Hai/T2.
+
+**Quy tắc thứ trong tuần (môn đông):** Tổng SV theo **7 ký tự đầu** MalopHP ≥ ngưỡng sidebar → chỉ xếp **T7 hoặc CN**; môn nhỏ hơn → **T2–T7** (không CN). Dùng `weekday_at_day_index()` (Thứ Hai = 0 … Chủ nhật = 6).
+
+### 3.4 Tách môn lớn và trần SV mỗi ca
 
 - Khi bật «Tách môn lớn» và đặt **ngưỡng SV tối đa / 1 ca**: đó là **trần cứng** — **không ca nào** được vượt quá số SV đó (kể cả một MalopHP rất đông hoặc sau khi FFD gom lớp).
 - Quy trình gần đúng: chia nhóm theo lớp (FFD theo quy mô) → với mỗi nhóm, **cắt thêm** danh sách SV theo từng khúc ≤ ngưỡng → sinh thêm ca nếu cần.
 - Tên hiển thị: `(đề k/N)`; nếu một đề phải tách thêm theo SV: `— nhóm j/n`.
 
-### 3.4 Pipeline sau khi bấm «Xếp lịch thi»
+### 3.5 Pipeline sau khi bấm «Xếp lịch thi»
 
 1. **Chẩn đoán trước** (`diagnose`): khả thi sơ bộ, mật độ xung đột, Khoa_nhom vs số ngày, v.v.
-2. **Greedy** (`heuristic.schedule_greedy`): đặt lần lượt từng ca vào slot hợp lệ, chấm điểm slot (cân tải, prep mềm, PBL muộn, soft cap, repair). **Thứ tự ca**: khóa số (2 chữ) giảm dần → `priority` (PBL) → bậc xung đột → quy mô SV. **Prep mềm**: ca thuộc **khóa cũ hơn** (so với khóa lớn nhất trong đợt) có **trọng số phạt prep thấp hơn** (chấp nhận dễ xếp «chật» hơn).
-3. **Nới ràng buộc (tuỳ chọn)**: capacity tổng phòng → `max môn/SV/ngày` → cuối cùng mới cho **trùng SV trên cùng slot** (last resort, có log). **Khoa_nhom** và **trùng slot do SV** ở các bước trước vẫn cứng.
-4. **LNS** (`lns_improve`): thử chuyển ca vi phạm prep sang slot khác (vẫn kiểm Khoa_nhom, xung đột, v.v.).
-5. **CP-SAT** (nếu đủ nhỏ): đánh bóng nghiệm, warm-start từ Greedy+LNS; có ràng buộc **ngày khác nhau** cho cặp ca vi phạm Khoa_nhom (học phần khác nhau).
+2. **Greedy** (`schedule_greedy`): sóng khóa → chọn slot (cân tải, prep cặp TC, Sunday-spread, PBL muộn, soft cap). **Khoa_nhom** và **không trùng SV cùng slot** giữ cứng đến bước (5); bước (6)–(7) đảm bảo **100% môn có slot**.
+3. **Nới ràng buộc** (nếu còn ca chưa đặt): xem [mục 3.3](#33-ngày-ôn-prep-day--một-quy-tắc-thống-nhất).
+4. **LNS** (`lns_improve`): move-based — prep cứng; pass **cùng-ngày**; thêm **pass sửa prep** (chỉ nhận move làm giảm tổng vi phạm).
+5. **CP-SAT** (tuỳ chọn): chỉ khi `số_môn × số_slot ≤ 500_000` và `số_cặp_xung_đột ≤ 60_000` và còn ≥ 10s; warm-start từ Greedy+LNS. Soft prep SAT cũng dùng **max(TC)** cặp.
 
-### 3.5 Phân phòng và «cùng khu»
+> **Thực tế dataset lớn:** thường thấy `greedy+lns` trong KPI; dòng log có thể ghi «Đã bỏ bước SAT vì bài toán quá lớn».
 
-- Sau khi có **ngày + ca** cho từng môn: `assign_rooms_and_invigilators` gán phòng + giám thị theo loại hình thi và sức chứa.
-- **Cùng khu** khi cần nhiều phòng: **ký tự đầu của `RoomID`** (in hoa), không dùng cột `Location`.
+### 3.6 Phân phòng, mã ghép phòng & «cùng khu»
 
-### 3.6 Đổi lịch thủ công & xuất
+- Sau khi có **ngày + ca**: `assign_rooms_and_invigilators` gán phòng + giám thị (tự luận / trắc nghiệm / vấn đáp).
+- **Cùng khu** khi nhiều phòng: **ký tự đầu `RoomID`** (vd `B101`, `B205` → khu `B`).
+- **Chia SV theo phòng** (theo sức chứa, sort mã SV); sinh **`Ma_phong_chia`**:
+
+  ```
+  [7 ký tự đầu MalopHP] + [ký hiệu ca, bỏ gạch dưới] + [STT phòng 2 số]
+  ```
+
+  Ví dụ: học phần `1012107`, ca `C1`, phòng thứ 1 → `1012107C101`  
+  (tương đương quy ước `1012107_C1_01`).
+
+- Cột Excel: `Ma_phong_chia` (theo môn: danh sách; theo SV: một mã); `Phong` = mã phòng vật lý.
+
+### 3.7 Đổi lịch thủ công & xuất
 
 - Tab đổi lịch: gửi lại solver với `fixed_slots` (ca đổi khóa vào slot mới), các ca khác **repair** gần lịch cũ (hàm mục tiêu khoảng cách slot).
 - Ghim lịch mâu thuẫn **Khoa_nhom** có thể bị bỏ ghim và ghi trong log nới ràng buộc.
@@ -199,11 +244,13 @@ Xem mục [kết quả & tab](#6-đọc-kết-quả--6-tab).
 
 | Thông số | Mặc định | Ý nghĩa |
 |---|---|---|
-| Số ngày ôn / 1 tín chỉ | 0.6 | Môn `n` TC cần ~`0.6n` ngày giữa môn trước. |
-| Số ngày ôn tối thiểu (cứng) | 0.0 | Nếu >0 → ép cứng `\|day_i − day_j\| ≥ ⌈x⌉` cho cặp xung đột. |
+| Số ngày ôn / 1 tín chỉ (`prep_day_per_credit`) | 0.6 | **Biến cấu hình** — môn `n` TC cần ~`n × hệ_số` ngày giữa hai môn liên tiếp (theo **max TC** cặp). |
+| Số ngày ôn tối thiểu (`min_prep_days`) | 1.0 (khuyên dùng) | Sàn cứng: mọi cặp môn cùng SV cách ≥ `⌈min_prep_days⌉` ngày (cộng thêm quy tắc theo TC). |
 | Max môn / SV / ngày | 2 | Số đề thi tối đa 1 SV được phép thi/ngày. |
+| Ngưỡng «môn rất đông» (T7–CN) | 800 | 0 = tắt. Đếm SV theo **7 ký tự đầu** MalopHP; ≥ ngưỡng → chỉ thi cuối tuần. |
+| Ưu tiên giãn lịch (`spread_prep_factor`) | 1.75 | Tăng (2.0–2.5) để Greedy/LNS né xếp sát hơn khi data lớn. |
 
-**Ưu tiên khóa (tự động — không có ô tắt trên UI):** Greedy xếp ca có **mã khóa** (2 chữ số đầu của 4 ký tự cuối `MalopHP`) **lớn hơn** trước; phạt **prep-day mềm** nhẹ hơn với ca chủ yếu **khóa cũ** trong đợt. Chi tiết: [mục 3](#3-logic-xếp-lịch--nghiệp-vụ).
+**Sóng khóa (tự động):** xếp khóa mới trước, khóa cũ sau; prep mềm nhẹ hơn với ca khóa cũ. Chi tiết: [mục 3.2–3.3](#32-malophp-7-ký-tự-đầu-4-ký-tự-cuối-và-2-số-khóa).
 
 ### Tách môn lớn (auto-split) ✨
 
@@ -228,7 +275,7 @@ Xem mục [kết quả & tab](#6-đọc-kết-quả--6-tab).
 |---|---|---|
 | Thời gian tối đa (s) | 120 | Tổng thời gian solver. Greedy thường xong < 30s; LNS thêm ~20s. |
 | Bật tối ưu (LNS + CP-SAT polish) | ✅ | Tắt = chỉ chạy greedy (cực nhanh nhưng vi phạm prep cao). |
-| Tự nới ràng buộc khi vô nghiệm | ✅ | Cascade-relax tự động: `min_prep_days` → `max_exams/ngày` → cho phép xung đột tối thiểu. |
+| Tự nới ràng buộc khi vô nghiệm | ✅ | Cascade 7 bước → **bắt buộc 100% môn có slot** (bước 6–7). Không chạy lại greedy với `min_prep_days=0`. |
 
 > ⚠️ Hệ thống **tự bỏ CP-SAT** khi `số môn × số slot > 500,000` hoặc `số xung đột > 60,000`
 > để tránh dựng model 10M+ vars (timeout chắc chắn). Bù lại bằng LNS.
@@ -264,12 +311,12 @@ Phía dưới có **biểu đồ tải SV theo ngày** + **heatmap (Ngày × Ca)
 ### Tab 3 – 📅 Lịch theo môn
 
 - Filter theo tên môn / loại môn (theory/oral/computer) / ngày.
-- Cột `Sections` hiện danh sách lớp gộp.
+- Cột `MalopHP`, `Ma_phong_chia` (mã ghép phòng/ca), `Phong`, `Ma_khoa_hoc_phan_7`, v.v.
 
 ### Tab 4 – 👤 Lịch theo SV
 
 - Search theo mã SV / tên SV.
-- Liệt kê đầy đủ lịch của SV qua các ngày.
+- Mỗi dòng: lịch SV + **`Ma_phong_chia`** (một phòng) + **`Phong`** (mã phòng vật lý).
 
 ### Tab 5 – 🏫 Phòng & giám thị
 
@@ -284,11 +331,11 @@ Phía dưới có **biểu đồ tải SV theo ngày** + **heatmap (Ngày × Ca)
 
 ### Xuất Excel
 
-Cuối trang có nút **⬇️ Tải xuống `ket_qua_xep_lich_thi.xlsx`** với 4 sheet:
-- `LichThi` – cột chuẩn.
-- `ViPhamNgayOn` – chi tiết vi phạm prep.
-- `TheoSinhVien` – view per-student (~100k dòng cho dataset thật).
-- `KPI` – bảng số tổng hợp.
+Cuối trang có nút **⬇️ Tải xuống `ket_qua_xep_lich_thi.xlsx`** với các sheet:
+- `Lich_thi` – lịch theo ca/môn (có `Ma_phong_chia`, `Phong`, …).
+- `Vi_pham_ngay_on` – vi phạm prep (`required` theo **max TC** cặp).
+- `Theo_sinh_vien` – view theo SV (~100k dòng dataset lớn).
+- `KPI` – tóm tắt số liệu.
 
 ---
 
@@ -317,12 +364,14 @@ Cuối trang có nút **⬇️ Tải xuống `ket_qua_xep_lich_thi.xlsx`** với
 | Tải SV/ngày lệch 5× | Đổi preset sang **"Cân bằng tải"** trong sidebar. |
 | Có sheet `KPI` báo `MaxSV/Slot` > sức chứa phòng | Giảm `soft_slot_cap` xuống dưới tổng sức chứa. |
 
-### Quá nhiều vi phạm prep-day
+### Quá nhiều vi phạm prep-day / môn 4TC sát môn đông CN
 
 | Triệu chứng | Cách xử lý |
 |---|---|
-| > 1,000 vi phạm | Tăng số vòng LNS (3 → 5). |
-| Số SV bị "thi 2 môn cùng ngày" cao | Giảm `max môn/SV/ngày` xuống 1 (đảm bảo cứng), hoặc tăng prep_day_per_credit. |
+| > 1,000 vi phạm | Tăng LNS (3 → 5), `spread_prep_factor` (1.75 → 2.5). |
+| Môn 4TC chỉ 1 ngày sau môn CN đông | Đã ép **max(TC)×prep** ở Greedy/LNS; tăng `prep_day_per_credit` hoặc `min_prep_days`; kiểm tra log có «Nới ôn theo tín chỉ» không. |
+| Số SV bị "thi 2 môn cùng ngày" cao | `max môn/SV/ngày` = 1; tăng `prep_day_per_credit`. |
+| Chỉ chạy `greedy` (không LNS) | Bật tối ưu + LNS ≥ 3 trong sidebar. |
 
 ### PBL/đồ án không ở cuối đợt
 
@@ -349,12 +398,12 @@ Cuối trang có nút **⬇️ Tải xuống `ket_qua_xep_lich_thi.xlsx`** với
                   │
 ┌─────────────────▼───────────────────────────────────┐
 │ engine/heuristic.py — Greedy + LNS                  │
-│  • Thứ tự ca: khóa (2 số đầu của 4 cuối MalopHP) giảm dần → priority → bậc → size │
-│  • Score slot = PBL + balance + prep (nhẹ hơn với khóa cũ) + repair │
-│  • Khoa_nhom cứng (trừ ca tách cùng học phần)       │
-│  • Soft cap nearly-hard (bậc 1.5 + base 10k)        │
-│  • Cascade-relax khi unplaced (Khoa_nhom vẫn cứng)  │
-│  • lns_improve(): move-based LS (+ Khoa_nhom)       │
+│  • Sóng khóa MalopHP → priority → bậc → size       │
+│  • Prep cứng: max(TC)×prep + min_prep (cặp môn)    │
+│  • Score: balance + prep cặp + Sunday-spread + PBL  │
+│  • diagnostics: prep_days_required_for_pair, weekday│
+│  • Cascade → force 100% placed (steps 6–7)          │
+│  • lns_improve: prep_feasible, same-day pass        │
 └─────────────────┬───────────────────────────────────┘
                   │ assignment + warm-start
 ┌─────────────────▼───────────────────────────────────┐
@@ -368,9 +417,9 @@ Cuối trang có nút **⬇️ Tải xuống `ket_qua_xep_lich_thi.xlsx`** với
                   │ final scheduled
 ┌─────────────────▼───────────────────────────────────┐
 │ engine/rooms.py                                     │
-│  • Gom phòng cùng khu = cùng ký tự đầu RoomID      │
-│  • FFD bin-packing theo phòng to nhất               │
-│  • Cân bằng tải giám thị theo (ngày, total)         │
+│  • Gom phòng cùng khu = ký tự đầu RoomID            │
+│  • Chia SV theo capacity → Ma_phong_chia           │
+│  • format_ma_phong_chia: 7 ký tự + ca + STT phòng  │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -388,10 +437,11 @@ Cuối trang có nút **⬇️ Tải xuống `ket_qua_xep_lich_thi.xlsx`** với
 5. Domain `slot_i` lọc theo `exam_type` và quy tắc thứ trong tuần (môn đông → T7–CN, v.v.).
 6. `slot_i = target` cho `fixed_slots` (đổi lịch thủ công).
 
-**Hàm mục tiêu (mềm)**
+**Hàm mục tiêu (mềm)** — `req(i,j) = max(min_prep, max(TC_i, TC_j) × prep_per_credit)`
 ```
 Minimize:
-  Σ overlap(i,j) × max(0, req_days(i,j) − |day_i − day_j|)     # prep-day
+  Σ overlap(i,j) × max(0, req(i,j) − |day_i − day_j|)          # prep-day
++ Σ same_day(i,j) × weight                                     # ưu tiên bỏ cùng ngày
 + Σ priority_i × (max_day − day_i)                             # PBL push-late
 + Σ |slot_i − base_slot_i|                                     # repair distance
 ```
@@ -408,11 +458,14 @@ Mỗi vòng (`iteration`):
 
 ### Cascade-relax (greedy phase)
 
-1. Bỏ giới hạn sức chứa tổng phòng.
-2. Bỏ `max_exams_per_day`.
-3. Cho phép xung đột SV tối thiểu (last resort, log lại).
+1. Bỏ giới hạn sức chứa tổng phòng.  
+2. Bỏ `max_exams_per_day`.  
+3. Trùng SV — giữ ôn + giãn CN.  
+4. Nới Khoa_nhom (vẫn giữ ôn/CN).  
+5. Ép cuối — nới ôn/CN chỉ khi bắt buộc, minimize vi phạm.  
+6. Slot 0 khẩn cấp.
 
-**Khoa_nhom** và **xung đột slot (SV trùng)** ở các bước trước vẫn được giữ cứng; chỉ bước (3) mới cho phép trùng SV tối thiểu.
+Helper prep: `engine/diagnostics.py` — `prep_days_required_for_pair`, `min_calendar_gap_days_between_exams`, `weekday_at_day_index`.
 
 ---
 
@@ -445,11 +498,11 @@ ExamScheduling/
 ├── engine/
 │   ├── models.py            # dataclass: Exam, Room, ScheduledExam, SolveStats, …
 │   ├── io.py                # đọc Excel, build exams, auto-split
-│   ├── diagnostics.py       # FeasibilityReport, SchedulingKPI
-│   ├── heuristic.py         # DSATUR greedy + LNS move-based
-│   ├── scheduler.py         # CP-SAT polish (hybrid entry)
-│   ├── rooms.py             # phân phòng FFD + giám thị
-│   └── exporters.py         # xuất Excel: LichThi/ViPham/TheoSinhVien/KPI
+│   ├── diagnostics.py       # KPI, prep helpers, weekday, Khoa_nhom
+│   ├── heuristic.py         # Greedy sóng khóa + LNS
+│   ├── scheduler.py         # solve(), detect_prep_violations, CP-SAT
+│   ├── rooms.py             # phân phòng + Ma_phong_chia
+│   └── exporters.py         # Excel: Lich_thi / Vi_pham_ngay_on / …
 ├── data/                    # nơi đặt file mẫu (gitignored)
 ├── requirements.txt
 └── README.md
@@ -478,21 +531,24 @@ from engine.rooms import assign_rooms_and_invigilators
 
 window = load_schedule_window("Ke_hoach_thi.xlsx")
 regs = load_registrations("DSSV.xlsx")
-exams, student_ref = build_exams(regs, prep_day_per_credit=0.6, max_exam_size=1500)
+prep = 0.6  # hoặc giá trị từ cấu hình trường
+exams, student_ref = build_exams(regs, prep_day_per_credit=prep, max_exam_size=1500)
 
 result = solve(
     exams=exams,
     window=window,
     rooms=[],
     allowed_sessions_by_exam_id={...},
-    prep_day_per_credit=0.6,
-    min_prep_days=0,
+    prep_day_per_credit=prep,
+    min_prep_days=1.0,
     max_exams_per_day=2,
     solver_time_limit_seconds=120,
     balance_weight=0.3,
     soft_slot_cap=1500,
     lns_iterations=3,
+    spread_prep_factor=1.75,
+    weekend_large_course_min_students=800,
 )
-# result.scheduled: List[ScheduledExam]
-# result.stats: SolveStats (KPI tóm tắt)
+# result.scheduled — room_ids, room_split_codes sau assign_rooms_and_invigilators
+# detect_prep_violations(..., prep_day_per_credit=prep, min_prep_days=1.0)
 ```

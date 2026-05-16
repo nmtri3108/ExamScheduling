@@ -69,13 +69,26 @@ def schedule_to_dataframe(
     return pd.DataFrame(rows)
 
 
-def violations_to_dataframe(violations: List[PrepViolation]) -> pd.DataFrame:
+def violations_to_dataframe(
+    violations: List[PrepViolation],
+    newest_cohort_code: int = 0,
+) -> pd.DataFrame:
+    anchor_s = f"{int(newest_cohort_code):02d}" if newest_cohort_code > 0 else ""
     rows = []
     for v in violations:
+        code = str(getattr(v, "student_cohort_code", "") or "").strip()
+        mk = int(getattr(v, "student_cohort", 0) or 0)
+        display_code = code or (f"{mk:02d}" if mk > 0 else "")
         rows.append(
             {
                 "Ma_sinh_vien": v.student_id,
                 "Ten_sinh_vien": v.student_name,
+                "Ma_khoa_SV": display_code,
+                "La_khoa_moi_nhat": (
+                    "Có"
+                    if anchor_s and display_code == anchor_s
+                    else ("Không" if display_code else "")
+                ),
                 "Mon_thi_truoc": v.earlier_exam,
                 "Mon_thi_sau": v.later_exam,
                 "Ma_ca_thi_sau": getattr(v, "later_exam_id", "") or "",
@@ -164,15 +177,40 @@ def exam_view_dataframe(scheduled: List[ScheduledExam], exams: List[Exam]) -> pd
     return df.sort_values(["Ngay_thi", "So_ca", "Ten_mon"])
 
 
+def unplaced_to_dataframe(diagnostics: list) -> pd.DataFrame:
+    rows = []
+    for d in diagnostics or []:
+        sug = getattr(d, "suggestions_vi", None) or []
+        rows.append(
+            {
+                "Ma_ca_thi": getattr(d, "exam_id", ""),
+                "Ten_mon": getattr(d, "course_name", ""),
+                "Loai_hinh": getattr(d, "exam_type", ""),
+                "So_SV": getattr(d, "size", 0),
+                "SV_khoa_nam_1": getattr(d, "year1_student_count", 0),
+                "So_cap_xung_dot": getattr(d, "conflict_pair_count", 0),
+                "So_o_thu": getattr(d, "candidate_slots", 0),
+                "Nguyen_nhan_chinh": getattr(d, "primary_blocker_vi", ""),
+                "Chi_tiet": getattr(d, "detail_vi", ""),
+                "Mon_xung_dot_nhieu": "; ".join(getattr(d, "top_conflict_courses", None) or []),
+                "Goi_y": " | ".join(sug) if sug else "",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def to_excel_bytes(
     schedule_df: pd.DataFrame,
     violations_df: pd.DataFrame,
     student_df: pd.DataFrame | None = None,
     kpi_rows: list[tuple[str, object]] | None = None,
+    unplaced_df: pd.DataFrame | None = None,
 ) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         schedule_df.to_excel(writer, index=False, sheet_name="Lich_thi")
+        if unplaced_df is not None and not unplaced_df.empty:
+            unplaced_df.to_excel(writer, index=False, sheet_name="Mon_chua_xep")
         violations_df.to_excel(writer, index=False, sheet_name="Vi_pham_ngay_on")
         if student_df is not None and not student_df.empty:
             student_df.to_excel(writer, index=False, sheet_name="Theo_sinh_vien")

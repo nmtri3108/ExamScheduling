@@ -6,6 +6,12 @@ from typing import Dict, List, Tuple
 
 import pandas as pd
 
+from .diagnostics import (
+    build_student_cohort_code_map,
+    build_student_cohort_map,
+    cohort_code_from_malop,
+    cohort_index_from_malop,
+)
 from .models import Exam, Invigilator, Registration, Room, ScheduleWindow
 
 
@@ -156,7 +162,7 @@ def build_exams(
     prep_day_per_credit: float = 0.6,
     common_section_threshold: int = 3,
     max_exam_size: int | None = None,
-) -> Tuple[List[Exam], Dict[str, Registration]]:
+) -> Tuple[List[Exam], Dict[str, Registration], Dict[str, int], Dict[str, str]]:
     """Tạo danh sách Exam từ Registration.
 
     Args:
@@ -168,7 +174,7 @@ def build_exams(
             None = không áp trần (giữ nguyên một ca / đề chung theo logic nhóm).
     """
     if not registrations:
-        return [], {}
+        return [], {}, {}
 
     df = pd.DataFrame(
         [
@@ -185,6 +191,8 @@ def build_exams(
             for r in registrations
         ]
     )
+    df["cohort_code"] = df["section_id"].map(cohort_code_from_malop)
+    df["cohort_idx"] = df["section_id"].map(cohort_index_from_malop)
 
     section_counts = df.groupby("course_norm")["section_id"].nunique()
     thr = int(common_section_threshold)
@@ -297,7 +305,13 @@ def build_exams(
     student_ref: Dict[str, Registration] = {}
     for r in registrations:
         student_ref[r.student_id] = r
-    return exams, student_ref
+    student_cohort_codes = build_student_cohort_code_map(
+        exams, registrations=registrations, year1_anchor=0
+    )
+    student_cohort = build_student_cohort_map(
+        exams, registrations=registrations, student_cohort_codes=student_cohort_codes
+    )
+    return exams, student_ref, student_cohort, student_cohort_codes
 
 
 # ---------------------------------------------------------------------------

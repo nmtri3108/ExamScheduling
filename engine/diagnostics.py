@@ -219,6 +219,9 @@ class SchedulingKPI:
     max_students_per_slot: int = 0
     prep_violation_count: int = 0
     prep_violation_students: int = 0
+    prep_violation_count_year1: int = 0
+    prep_violation_students_year1: int = 0
+    newest_cohort_code: int = 0  # niên khóa SV năm 1 (setting hoặc auto)
     # Vi phạm có actual_days ≤ 0 (cùng ngày / "0 ngày ôn") — chỉ số đau nhất cho SV.
     same_day_violation_count: int = 0
     same_day_violation_students: int = 0
@@ -243,21 +246,75 @@ def _malop_prefix_7_for_exam(exam: Exam) -> str:
     return cid[:7] if len(cid) >= 7 else cid
 
 
+def cohort_code_from_malop(section_id: str) -> str:
+    """Niên khóa (2 ký tự) = hai ký tự đầu của 4 ký tự cuối MalopHP."""
+    kn = khoa_nhom_from_malop(section_id)
+    return kn[:2] if len(kn) >= 2 else ""
+
+
+def cohort_index_from_malop(section_id: str) -> int:
+    """Mã khóa dạng số (0 nếu không phải 2 chữ số). Dùng hiển thị / KPI."""
+    code = cohort_code_from_malop(section_id)
+    return int(code) if len(code) == 2 and code.isdigit() else 0
+
+
+def cohort_numeric_value(code: str) -> int | None:
+    """Giá trị số của mã khóa 2 chữ số; ``None`` nếu không phải số (yy, zz, …)."""
+    c = str(code or "").strip()
+    if len(c) == 2 and c.isdigit():
+        return int(c)
+    return None
+
+
+# Sóng xếp / ôn: mã không thuộc chuỗi học vụ ≤ anchor (vd 48, yy) → ưu tiên cuối.
+_COHORT_LOW_PRIORITY_WAVE = 1_000_000
+
+
+def cohort_wave_index(code: str, year1_anchor: int) -> int:
+    """Sóng ưu tiên: 0 = khóa anchor (năm 1), 1 = anchor−1, …; mã lạ / > anchor → cuối."""
+    if year1_anchor <= 0:
+        n = cohort_numeric_value(code)
+        if n is None:
+            return _COHORT_LOW_PRIORITY_WAVE
+        return max(0, 99 - n)
+    n = cohort_numeric_value(code)
+    if n is not None and 0 <= n <= year1_anchor:
+        return year1_anchor - n
+    return _COHORT_LOW_PRIORITY_WAVE
+
+
+def resolve_year1_cohort_anchor(
+    year1_anchor_setting: int,
+    exams: List[Exam] | None = None,
+    student_cohort_codes: Dict[str, str] | None = None,
+) -> int:
+    """Khóa SV năm 1: từ setting sidebar; 0 = tự lấy max mã số hợp lệ trong data."""
+    if int(year1_anchor_setting or 0) > 0:
+        return int(year1_anchor_setting)
+    mx = 0
+    if student_cohort_codes:
+        for code in student_cohort_codes.values():
+            n = cohort_numeric_value(code)
+            if n is not None:
+                mx = max(mx, n)
+    if exams:
+        for ex in exams:
+            for sec in ex.section_ids:
+                n = cohort_numeric_value(cohort_code_from_malop(sec))
+                if n is not None:
+                    mx = max(mx, n)
+    return mx
+
+
 def khoa_nhom_from_malop(section_id: str) -> str:
-    """4 ký tự cuối MalopHP (Khoa_nhom): các ca có cùng hậu tố không được thi cùng một ngày."""
+    """Khoa_nhom = 4 ký tự cuối MalopHP (vd ``104181025102122`` → ``2122``).
+
+    Hai môn khác học phần cùng hậu tố này không thi cùng một ngày.
+    """
     s = str(section_id or "").strip()
     if not s:
         return ""
     return s[-4:] if len(s) >= 4 else s
-
-
-def cohort_index_from_malop(section_id: str) -> int:
-    """Hai ký tự đầu của 4 ký tự cuối MalopHP — mã khóa (vd 25, 22). Chỉ lấy nếu cả hai là chữ số."""
-    kn = khoa_nhom_from_malop(section_id)
-    if len(kn) < 2:
-        return 0
-    head = kn[:2]
-    return int(head) if head.isdigit() else 0
 
 
 def exam_khoa_nhom_keys(exam: Exam) -> frozenset[str]:
@@ -271,11 +328,19 @@ def exam_khoa_nhom_keys(exam: Exam) -> frozenset[str]:
 
 
 def exam_max_cohort_index(exam: Exam) -> int:
-    """Khóa lớn nhất gắn với ca (max trên mọi MalopHP): khóa số lớn hơn → ưu tiên xếp lịch trước."""
+    """Khóa số lớn nhất trên ca (legacy / hiển thị)."""
     mx = 0
     for sec in exam.section_ids:
         mx = max(mx, cohort_index_from_malop(sec))
     return mx
+
+
+def exam_min_cohort_wave(exam: Exam, year1_anchor: int) -> int:
+    """Sóng ưu tiên của ca = sóng tốt nhất (nhỏ nhất) trong các MalopHP của ca."""
+    waves = [cohort_wave_index(cohort_code_from_malop(sec), year1_anchor) for sec in exam.section_ids]
+    if not waves:
+        return _COHORT_LOW_PRIORITY_WAVE
+    return min(waves)
 
 
 def prep_days_required_for_exam(
@@ -298,6 +363,28 @@ def prep_days_required_for_pair(
     return max(float(min_prep_days), cred * float(prep_day_per_credit))
 
 
+def prep_hard_gap_days_for_pair(
+    exam_a: Exam,
+    exam_b: Exam,
+    prep_day_per_credit: float,
+    min_prep_days: float = 0.0,
+    *,
+    year1_allow_same_day: bool = True,
+    for_year1_student: bool = False,
+    same_calendar_day: bool = False,
+) -> float:
+    """Khoảng lịch tối thiểu khi **đặt cứng** (greedy/LNS).
+
+  SV khóa năm 1 + ``year1_allow_same_day``: **được thi cùng ngày** (không chặn ôn cùng ngày);
+  giữa **hai ngày thi khác nhau** cần đủ ngày ôn theo tín chỉ (ngày ôn > 0).
+    """
+    if year1_allow_same_day and for_year1_student and same_calendar_day:
+        return 0.0
+    return prep_days_required_for_pair(
+        exam_a, exam_b, prep_day_per_credit, min_prep_days
+    )
+
+
 def min_calendar_gap_days_between_exams(
     exam_a: Exam,
     exam_b: Exam,
@@ -311,19 +398,98 @@ def min_calendar_gap_days_between_exams(
     return int(ceil(req))
 
 
-def exam_cohort_wave_index(exam: Exam, global_max_cohort: int) -> int:
-    """Sóng xếp lịch: 0 = khóa mới nhất trong đợt (≈ năm 1), tăng dần theo khóa cũ hơn.
+def resolve_global_max_cohort(
+    exams: List[Exam],
+    student_cohort: Dict[str, int] | None = None,
+) -> int:
+    """Mã khóa lớn nhất trong đợt (= ≈ năm 1) — luôn suy từ data, không hardcode 25/26/27.
 
-    Hai chữ số đầu của 4 ký tự cuối MalopHP được coi là mã khóa nhập học (vd 25, 22).
-    `global_max_cohort` = max trên toàn bộ ca thi; ca có max=25 xếp trước ca có max=22.
-    Malop không đọc được khóa (0) → sóng cuối để không chặn các ca khác.
+    Lấy max trên mọi MalopHP (ca thi) và mọi đăng ký SV để đợt sau tự đổi (26, 27, …).
     """
-    mx = exam_max_cohort_index(exam)
-    if mx <= 0:
-        return 1_000_000
-    if global_max_cohort <= 0:
-        return 0
-    return int(global_max_cohort) - int(mx)
+    mx_exam = max((exam_max_cohort_index(e) for e in exams), default=0)
+    mx_stu = max(student_cohort.values(), default=0) if student_cohort else 0
+    return int(max(mx_exam, mx_stu))
+
+
+def build_student_cohort_code_map(
+    exams: List[Exam],
+    registrations: List | None = None,
+    year1_anchor: int = 0,
+) -> Dict[str, str]:
+    """Mã khóa 2 ký tự / SV = mã có sóng ưu tiên cao nhất (nhỏ nhất) trên mọi đăng ký."""
+    anchor = resolve_year1_cohort_anchor(year1_anchor, exams=exams)
+    codes_by_sid: Dict[str, List[str]] = defaultdict(list)
+    if registrations:
+        for r in registrations:
+            code = cohort_code_from_malop(getattr(r, "section_id", ""))
+            if code:
+                codes_by_sid[str(r.student_id)].append(code)
+    for ex in exams:
+        for sid in ex.student_ids:
+            for sec in ex.section_ids:
+                code = cohort_code_from_malop(sec)
+                if code:
+                    codes_by_sid[str(sid)].append(code)
+    out: Dict[str, str] = {}
+    for sid, codes in codes_by_sid.items():
+        out[sid] = min(codes, key=lambda c: cohort_wave_index(c, anchor))
+    return out
+
+
+def build_student_cohort_map(
+    exams: List[Exam],
+    registrations: List | None = None,
+    year1_anchor: int = 0,
+    student_cohort_codes: Dict[str, str] | None = None,
+) -> Dict[str, int]:
+    """Mã khóa số / SV (0 nếu yy/zz). Ưu tiên map mã 2 ký tự nếu đã có."""
+    if student_cohort_codes is None:
+        student_cohort_codes = build_student_cohort_code_map(
+            exams, registrations=registrations, year1_anchor=year1_anchor
+        )
+    return {
+        sid: int(cohort_numeric_value(code) or 0)
+        for sid, code in student_cohort_codes.items()
+        if code
+    }
+
+
+def is_year1_anchor_student(
+    student_id: str,
+    student_cohort_codes: Dict[str, str],
+    year1_anchor: int,
+) -> bool:
+    """SV thuộc niên khóa năm 1 (theo setting) — bắt buộc đủ ngày ôn khi nới lịch."""
+    if year1_anchor <= 0:
+        return False
+    code = student_cohort_codes.get(str(student_id), "")
+    return cohort_numeric_value(code) == year1_anchor
+
+
+def is_newest_cohort_student(
+    student_id: str,
+    student_cohort: Dict[str, int],
+    global_max_cohort: int | None = None,
+    student_cohort_codes: Dict[str, str] | None = None,
+    year1_anchor: int | None = None,
+) -> bool:
+    """Alias: SV khóa anchor (năm 1)."""
+    anchor = int(year1_anchor or global_max_cohort or 0)
+    if student_cohort_codes is not None and anchor > 0:
+        return is_year1_anchor_student(student_id, student_cohort_codes, anchor)
+    gmax = (
+        int(global_max_cohort)
+        if global_max_cohort is not None
+        else max(student_cohort.values(), default=0)
+    )
+    if gmax <= 0:
+        return False
+    return student_cohort.get(str(student_id), 0) == gmax
+
+
+def exam_cohort_wave_index(exam: Exam, year1_anchor: int) -> int:
+    """Sóng xếp lịch theo setting niên khóa năm 1 (0 = khóa anchor, …)."""
+    return exam_min_cohort_wave(exam, year1_anchor)
 
 
 def same_course_khoa_nhom_waiver(e1: Exam, e2: Exam) -> bool:
@@ -440,6 +606,317 @@ def enumerate_feasible_slots_for_exam(
     return slots
 
 
+_BLOCKER_VI = {
+    "NO_SLOT": "Không có ô thời gian / ca thi trong cấu hình",
+    "WEEKDAY": "Quy tắc thứ (môn đông chỉ T7–CN; môn khác không Chủ nhật)",
+    "CONFLICT": "Trùng sinh viên với ca đã xếp (cùng ô thời gian)",
+    "YEAR1_PREP": "SV khóa năm 1: giữa hai ngày thi khác nhau chưa đủ ngày ôn theo tín chỉ",
+    "PREP_GAP": "Chưa đủ ngày ôn theo tín chỉ giữa hai môn",
+    "KHOA_NHOM": "Trùng Khoa_nhom (4 ký tự cuối MalopHP) cùng ngày — môn HP khác",
+    "PREFIX_HALF": "Khác buổi sáng/chiều với ca khác cùng 7 ký tự học phần",
+    "SUNDAY_SPREAD": "Quá gần môn đã xếp vào Chủ nhật (giãn tối thiểu 3 ngày)",
+    "MAX_PER_DAY": "Sinh viên đã đủ số môn thi tối đa trong ngày đó",
+    "CAPACITY": "Vượt sức chứa tổng ca (ước lượng greedy)",
+}
+
+_BLOCKER_PRIORITY = (
+    "NO_SLOT",
+    "WEEKDAY",
+    "YEAR1_PREP",
+    "CONFLICT",
+    "KHOA_NHOM",
+    "PREFIX_HALF",
+    "PREP_GAP",
+    "SUNDAY_SPREAD",
+    "MAX_PER_DAY",
+    "CAPACITY",
+)
+
+
+@dataclass
+class UnplacedExamDiagnostic:
+    exam_id: str
+    course_name: str
+    exam_type: str
+    size: int
+    year1_student_count: int
+    conflict_pair_count: int
+    candidate_slots: int
+    primary_blocker: str
+    primary_blocker_vi: str
+    detail_vi: str
+    suggestions_vi: List[str] = field(default_factory=list)
+    blocker_counts: Dict[str, int] = field(default_factory=dict)
+    top_conflict_courses: List[str] = field(default_factory=list)
+
+
+def diagnose_unplaced_exams(
+    unplaced_exam_ids: List[str],
+    exams: List[Exam],
+    assignment: Dict[str, int],
+    window: ScheduleWindow,
+    allowed_sessions_by_exam_id: Dict[str, List[int]],
+    *,
+    session_half: List[int] | None = None,
+    fixed_slots: Dict[str, int] | None = None,
+    max_exams_per_day: int = 2,
+    min_prep_days: float = 0.0,
+    prep_day_per_credit: float = 0.6,
+    total_capacity: int | None = None,
+    weekend_large_course_min_students: int = 0,
+    prefix_student_totals: Dict[str, int] | None = None,
+    student_cohort_codes: Dict[str, str] | None = None,
+    year1_cohort_anchor: int = 0,
+    year1_allow_same_day: bool = True,
+    sunday_spread_min: int = 3,
+) -> List[UnplacedExamDiagnostic]:
+    """Phân tích vì sao từng môn không gán được slot sau greedy (rất nguy hiểm nếu bỏ qua)."""
+    if not unplaced_exam_ids:
+        return []
+
+    exam_index = {e.exam_id: i for i, e in enumerate(exams)}
+    conflicts = build_conflict_index(exams)
+    code_map = student_cohort_codes or build_student_cohort_code_map(
+        exams, year1_anchor=year1_cohort_anchor
+    )
+    anchor = resolve_year1_cohort_anchor(year1_cohort_anchor, exams, code_map)
+    prefix_tot = prefix_student_totals or build_prefix_student_totals(exams)
+    fixed_slots = dict(fixed_slots or {})
+    spd = window.sessions_per_day
+    cap = total_capacity if total_capacity is not None else 10**9
+
+    slot_used_students: Dict[int, set] = defaultdict(set)
+    day_exams_per_student: Dict[Tuple[str, int], int] = defaultdict(int)
+    student_day_exams: Dict[str, Dict[int, List[int]]] = defaultdict(lambda: defaultdict(list))
+    slot_load: Dict[int, int] = defaultdict(int)
+    day_khoa: Dict[Tuple[int, str], List[int]] = defaultdict(list)
+    prefix_half_anchor: Dict[str, int] = {}
+    sunday_days: set = set()
+
+    for eid, slot in assignment.items():
+        if eid not in exam_index:
+            continue
+        idx = exam_index[eid]
+        ex = exams[idx]
+        day = int(slot) // spd
+        if weekday_at_day_index(window, day) == 6:
+            sunday_days.add(day)
+        slot_load[int(slot)] += ex.size
+        if session_half and ex.course_prefix_7:
+            sess = int(slot) % spd
+            h = int(session_half[sess]) if sess < len(session_half) else 0
+            pfx = ex.course_prefix_7
+            if pfx not in prefix_half_anchor:
+                prefix_half_anchor[pfx] = h
+        for sid in ex.student_ids:
+            slot_used_students[int(slot)].add(str(sid))
+            day_exams_per_student[(str(sid), day)] += 1
+            student_day_exams[str(sid)][day].append(idx)
+        for k in exam_khoa_nhom_keys(ex):
+            day_khoa[(day, k)].append(idx)
+
+    def _is_y1(sid: str) -> bool:
+        return anchor > 0 and is_year1_anchor_student(sid, code_map, anchor)
+
+    def _all_slots(ex: Exam) -> List[int]:
+        slots = enumerate_feasible_slots_for_exam(
+            ex,
+            window,
+            allowed_sessions_by_exam_id,
+            fixed_slots,
+            weekend_large_min_students=weekend_large_course_min_students,
+            prefix_totals=prefix_tot,
+            relax_weekday_rule=False,
+        )
+        if not slots:
+            slots = enumerate_feasible_slots_for_exam(
+                ex,
+                window,
+                allowed_sessions_by_exam_id,
+                fixed_slots,
+                weekend_large_min_students=weekend_large_course_min_students,
+                prefix_totals=prefix_tot,
+                relax_weekday_rule=True,
+            )
+        if not slots:
+            sessions = allowed_sessions_by_exam_id.get(
+                ex.exam_id, list(range(spd))
+            )
+            sessions = sorted({int(s) for s in sessions if 0 <= int(s) < spd})
+            if sessions:
+                slots = [
+                    d * spd + s for d in range(window.total_days) for s in sessions
+                ]
+        return slots
+
+    reports: List[UnplacedExamDiagnostic] = []
+
+    for eid in unplaced_exam_ids:
+        if eid not in exam_index:
+            continue
+        idx = exam_index[eid]
+        ex = exams[idx]
+        y1_count = sum(1 for sid in ex.student_ids if _is_y1(str(sid)))
+        conf_pairs = 0
+        top_conf: List[Tuple[int, str]] = []
+        for (i, j), w in conflicts.items():
+            if i == idx:
+                conf_pairs += 1
+                top_conf.append((w, exams[j].course_name))
+            elif j == idx:
+                conf_pairs += 1
+                top_conf.append((w, exams[i].course_name))
+        top_conf.sort(reverse=True)
+        top_names = [n for _, n in top_conf[:5]]
+
+        slots_strict = enumerate_feasible_slots_for_exam(
+            ex,
+            window,
+            allowed_sessions_by_exam_id,
+            fixed_slots,
+            weekend_large_min_students=weekend_large_course_min_students,
+            prefix_totals=prefix_tot,
+            relax_weekday_rule=False,
+        )
+        slots_all = _all_slots(ex)
+        counts: Dict[str, int] = defaultdict(int)
+        if not slots_all:
+            counts["NO_SLOT"] = 1
+        elif not slots_strict and slots_all:
+            counts["WEEKDAY"] = len(slots_all)
+
+        for slot in slots_all:
+            day = int(slot) // spd
+            blocked: set[str] = set()
+            if slot_load[slot] + ex.size > cap:
+                blocked.add("CAPACITY")
+            if max_exams_per_day > 0:
+                for sid in ex.student_ids:
+                    if day_exams_per_student[(str(sid), day)] >= max_exams_per_day:
+                        blocked.add("MAX_PER_DAY")
+                        break
+            for sid in ex.student_ids:
+                if str(sid) in slot_used_students[slot]:
+                    blocked.add("CONFLICT")
+                    break
+            keys = exam_khoa_nhom_keys(ex)
+            for k in keys:
+                for oidx in day_khoa.get((day, k), []):
+                    if not same_course_khoa_nhom_waiver(ex, exams[oidx]):
+                        blocked.add("KHOA_NHOM")
+                        break
+            if session_half and ex.course_prefix_7:
+                sess = int(slot) % spd
+                h = int(session_half[sess]) if sess < len(session_half) else 0
+                ah = prefix_half_anchor.get(ex.course_prefix_7)
+                if ah is not None and h != ah:
+                    blocked.add("PREFIX_HALF")
+            if sunday_days and weekday_at_day_index(window, day) != 6:
+                for sun_day in sunday_days:
+                    if abs(day - sun_day) < sunday_spread_min:
+                        for sid in ex.student_ids:
+                            if sun_day in student_day_exams.get(str(sid), {}):
+                                blocked.add("SUNDAY_SPREAD")
+                                break
+            if min_prep_days > 0 or prep_day_per_credit > 0:
+                for sid in ex.student_ids:
+                    y1 = _is_y1(str(sid))
+                    for d, olist in student_day_exams.get(str(sid), {}).items():
+                        for oidx in olist:
+                            same_day = d == day
+                            req = prep_hard_gap_days_for_pair(
+                                ex,
+                                exams[oidx],
+                                prep_day_per_credit,
+                                min_prep_days,
+                                year1_allow_same_day=year1_allow_same_day,
+                                for_year1_student=y1,
+                                same_calendar_day=same_day,
+                            )
+                            if req > 0 and abs(d - day) + 1e-9 < req:
+                                if y1:
+                                    blocked.add("YEAR1_PREP")
+                                else:
+                                    blocked.add("PREP_GAP")
+                                break
+                        if blocked:
+                            break
+                    if blocked:
+                        break
+            if not blocked:
+                continue
+            for b in blocked:
+                counts[b] += 1
+
+        if not counts and slots_all:
+            counts["YEAR1_PREP"] = len(slots_all)
+
+        primary = "UNKNOWN"
+        if counts:
+            primary = max(
+                counts.keys(),
+                key=lambda k: (counts[k], -_BLOCKER_PRIORITY.index(k) if k in _BLOCKER_PRIORITY else 0),
+            )
+        primary_vi = _BLOCKER_VI.get(primary, primary)
+        detail_parts = [
+            f"{_BLOCKER_VI.get(k, k)}: {v}/{max(1, len(slots_all))} ô"
+            for k, v in sorted(counts.items(), key=lambda x: -x[1])[:4]
+        ]
+        detail_vi = (
+            f"{len(slots_all)} ô thời gian thử; {y1_count}/{ex.size} SV thuộc khóa {anchor:02d}; "
+            f"{conf_pairs} cặp xung đột với môn khác. "
+            + ("; ".join(detail_parts) if detail_parts else "Mọi ô đều bị chặn bởi ràng buộc cứng.")
+        )
+        suggestions: List[str] = []
+        if primary == "NO_SLOT":
+            suggestions.append("Kiểm tra cấu hình ca thi (lý thuyết/PBL/máy) và file kế hoạch ngày.")
+        elif primary == "WEEKDAY":
+            suggestions.append("Mở rộng đợt thi hoặc giảm ngưỡng «môn rất đông chỉ T7–CN».")
+        elif primary == "YEAR1_PREP":
+            suggestions.append(
+                f"Giữa hai **ngày thi khác nhau**, SV khóa {anchor:02d} cần đủ ngày ôn — mở thêm ngày hoặc giãn lịch các môn trùng SV."
+            )
+            suggestions.append(
+                "Thi cùng ngày vẫn được phép (theo max môn/SV/ngày); không cần tách khóa 25 khỏi cùng ngày."
+            )
+            if y1_count < ex.size:
+                suggestions.append(
+                    "Một phần SV không phải khóa 25 — có thể tách ca theo nhóm khóa nếu được phép."
+                )
+        elif primary == "CONFLICT":
+            suggestions.append(
+                "Các môn có nhiều SV trùng đang tranh cùng ô — cần thêm ngày/ca hoặc tách đề."
+            )
+        elif primary == "KHOA_NHOM":
+            suggestions.append("Trải các môn cùng hậu tố 4 ký tự MalopHP ra nhiều ngày hơn.")
+        elif primary == "PREFIX_HALF":
+            suggestions.append("Các ca tách cùng học phần cần cùng buổi — thử mở thêm ngày cùng buổi.")
+        elif primary == "MAX_PER_DAY":
+            suggestions.append("Tăng «tối đa môn/SV/ngày» hoặc kéo dài đợt thi.")
+        else:
+            suggestions.append("Xem chi tiết từng dòng chặn ở trên và nới đúng ràng buộc tương ứng.")
+
+        reports.append(
+            UnplacedExamDiagnostic(
+                exam_id=eid,
+                course_name=ex.course_name,
+                exam_type=ex.exam_type,
+                size=ex.size,
+                year1_student_count=y1_count,
+                conflict_pair_count=conf_pairs,
+                candidate_slots=len(slots_all),
+                primary_blocker=primary,
+                primary_blocker_vi=primary_vi,
+                detail_vi=detail_vi,
+                suggestions_vi=suggestions,
+                blocker_counts=dict(counts),
+                top_conflict_courses=top_names,
+            )
+        )
+    reports.sort(key=lambda r: (-r.year1_student_count, -r.size, r.exam_id))
+    return reports
+
+
 def check_prep_no_time_by_prefix_hard(
     violations: List[PrepViolation],
     exams: List[Exam],
@@ -508,6 +985,10 @@ def compute_kpi(
     exams: List[Exam],
     window: ScheduleWindow,
     violations: List[PrepViolation],
+    student_cohort: Dict[str, int] | None = None,
+    student_cohort_codes: Dict[str, str] | None = None,
+    year1_cohort_anchor: int = 0,
+    year1_allow_same_day: bool = True,
 ) -> SchedulingKPI:
     kpi = SchedulingKPI()
     if not scheduled:
@@ -529,8 +1010,38 @@ def compute_kpi(
         kpi.max_students_per_slot = max(loads)
     kpi.prep_violation_count = len(violations)
     kpi.prep_violation_students = len({v.student_id for v in violations})
-    # Vi phạm "0 ngày ôn" — actual_days ≤ 0 và required_days > 0 (cùng ngày hoặc earlier).
-    same_day_vios = [v for v in violations if v.required_days > 0 and v.actual_days <= 0]
+    code_map = student_cohort_codes or build_student_cohort_code_map(
+        exams, year1_anchor=year1_cohort_anchor
+    )
+    cohort_map = student_cohort if student_cohort is not None else build_student_cohort_map(
+        exams, year1_anchor=year1_cohort_anchor, student_cohort_codes=code_map
+    )
+    anchor = resolve_year1_cohort_anchor(year1_cohort_anchor, exams, code_map)
+    kpi.newest_cohort_code = anchor
+    if anchor > 0:
+        # Khóa năm 1: thiếu ngày ôn giữa hai ngày khác nhau (thi cùng ngày không tính nếu cho phép).
+        y1_vios = [
+            v
+            for v in violations
+            if is_year1_anchor_student(v.student_id, code_map, anchor)
+            and v.required_days > 0
+            and v.actual_days + 1e-9 < v.required_days
+            and not (year1_allow_same_day and v.actual_days <= 0)
+        ]
+        kpi.prep_violation_count_year1 = len(y1_vios)
+        kpi.prep_violation_students_year1 = len({v.student_id for v in y1_vios})
+    # Vi phạm "0 ngày ôn" giữa hai môn khác ngày (cùng ngày chỉ tính khi không cho phép năm 1).
+    same_day_vios = [
+        v
+        for v in violations
+        if v.required_days > 0
+        and v.actual_days <= 0
+        and not (
+            year1_allow_same_day
+            and anchor > 0
+            and is_year1_anchor_student(v.student_id, code_map, anchor)
+        )
+    ]
     kpi.same_day_violation_count = len(same_day_vios)
     kpi.same_day_violation_students = len({v.student_id for v in same_day_vios})
 

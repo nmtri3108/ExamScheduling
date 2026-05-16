@@ -13,12 +13,18 @@ from typing import Dict, List
 import pandas as pd
 import streamlit as st
 
-from engine.diagnostics import compute_kpi, diagnose
+from engine.diagnostics import (
+    build_student_cohort_code_map,
+    build_student_cohort_map,
+    compute_kpi,
+    diagnose,
+)
 from engine.exporters import (
     exam_view_dataframe,
     schedule_to_dataframe,
     student_view_dataframe,
     to_excel_bytes,
+    unplaced_to_dataframe,
     violations_to_dataframe,
 )
 from engine.io import (
@@ -120,6 +126,10 @@ def _run_pipeline(
     computer_fill_high=0.95,
     weekend_large_course_min_students=0,
     spread_prep_factor=1.0,
+    student_cohort=None,
+    student_cohort_codes=None,
+    year1_cohort_anchor=0,
+    year1_allow_same_day=True,
 ):
     """Một bước: chẩn đoán → solve → phân phòng → vi phạm → KPI."""
     started = time.time()
@@ -160,6 +170,10 @@ def _run_pipeline(
         progress_cb=_cb,
         weekend_large_course_min_students=int(weekend_large_course_min_students),
         spread_prep_factor=float(spread_prep_factor),
+        student_cohort=student_cohort,
+        student_cohort_codes=student_cohort_codes,
+        year1_cohort_anchor=int(year1_cohort_anchor or 0),
+        year1_allow_same_day=bool(year1_allow_same_day),
     )
 
     room_report = assign_rooms_and_invigilators(
@@ -180,8 +194,21 @@ def _run_pipeline(
         student_name_map=student_name_map,
         prep_day_per_credit=float(prep_day_per_credit),
         min_prep_days=float(min_prep_days),
+        student_cohort=student_cohort,
+        student_cohort_codes=student_cohort_codes,
+        year1_cohort_anchor=int(year1_cohort_anchor or 0),
+        year1_allow_same_day=bool(year1_allow_same_day),
     )
-    kpi = compute_kpi(result.scheduled, exams, window, violations)
+    kpi = compute_kpi(
+        result.scheduled,
+        exams,
+        window,
+        violations,
+        student_cohort=student_cohort,
+        student_cohort_codes=student_cohort_codes,
+        year1_cohort_anchor=int(year1_cohort_anchor or 0),
+        year1_allow_same_day=bool(year1_allow_same_day),
+    )
     progress_bar.progress(100, text="Hoàn tất!")
     progress_bar.empty()
 
@@ -247,6 +274,27 @@ with st.sidebar:
             value=1.75,
             step=0.05,
             help="Càng cao thì càng cố tránh xếp hai môn của cùng sinh viên quá sát nhau (mục tiêu mềm).",
+        )
+        year1_cohort_anchor = st.number_input(
+            "Niên khóa SV năm 1 hiện tại (2 số đầu, 4 ký tự cuối MalopHP)",
+            min_value=0,
+            max_value=99,
+            value=25,
+            step=1,
+            help=(
+                "Ví dụ đặt **25**: ưu tiên xếp & giữ ngày ôn cho khóa **25**, rồi **24, 23, …**; "
+                "mã lạ hoặc số > 25 (yy, zz, 48, 49, 50, …) ưu tiên thấp nhất. "
+                "**0** = tự lấy mã số lớn nhất trong file đăng ký."
+            ),
+        )
+        year1_allow_same_day = st.checkbox(
+            "Khóa năm 1: được thi cùng ngày (ôn giữa hai ngày thi khác nhau)",
+            value=True,
+            help=(
+                "Bật (khuyên dùng): SV khóa năm 1 **có thể thi 2 môn/ngày** (theo max môn/SV/ngày). "
+                "Chỉ bắt đủ **ngày ôn theo tín chỉ** khi hai môn rơi vào **hai ngày lịch khác nhau**. "
+                "Khóa cũ hơn có thể nới ôn khi lịch chật. Tắt = bắt khóa năm 1 đủ ôn kể cả cùng ngày (rất khó xếp hết)."
+            ),
         )
 
     with st.expander("Bộ ca thi theo loại", expanded=True):
@@ -445,10 +493,20 @@ if run_btn:
             effective_cap = int(soft_slot_cap_value)
             if effective_cap <= 0:
                 effective_cap = int(sum(r.capacity for r in rooms) * 0.95) if rooms else 1500
-            exams, student_ref = build_exams(
+            exams, student_ref, student_cohort, student_cohort_codes = build_exams(
                 registrations,
                 prep_day_per_credit=float(prep_day_per_credit),
                 max_exam_size=int(max_exam_size) if enable_split else None,
+            )
+            y1_anchor = int(year1_cohort_anchor or 0)
+            student_cohort_codes = build_student_cohort_code_map(
+                exams, registrations=registrations, year1_anchor=y1_anchor
+            )
+            student_cohort = build_student_cohort_map(
+                exams,
+                registrations=registrations,
+                year1_anchor=y1_anchor,
+                student_cohort_codes=student_cohort_codes,
             )
             allowed_by_exam = {
                 e.exam_id: allowed_by_type.get(e.exam_type, allowed_by_type["theory"])
@@ -482,6 +540,10 @@ if run_btn:
             computer_fill_high=computer_fill_high,
             weekend_large_course_min_students=int(weekend_large_min_sv),
             spread_prep_factor=float(spread_prep_factor),
+            student_cohort=student_cohort,
+            student_cohort_codes=student_cohort_codes,
+            year1_cohort_anchor=y1_anchor,
+            year1_allow_same_day=bool(year1_allow_same_day),
         )
 
         st.session_state["scheduler_data"] = {
@@ -495,8 +557,12 @@ if run_btn:
             "invigilators": invigilators,
             "exams": exams,
             "student_name_map": student_name_map,
+            "student_cohort": student_cohort,
+            "student_cohort_codes": student_cohort_codes,
             "outcome": outcome,
             "config": {
+                "year1_cohort_anchor": y1_anchor,
+                "year1_allow_same_day": bool(year1_allow_same_day),
                 "prep_day_per_credit": float(prep_day_per_credit),
                 "min_prep_days": float(min_prep_days),
                 "max_exams_per_day": int(max_exams_per_day),
@@ -518,10 +584,19 @@ if run_btn:
                 "spread_prep_factor": float(spread_prep_factor),
             },
         }
-        st.success(
-            f"Xếp lịch hoàn tất trong {outcome['result'].stats.elapsed_seconds:.1f} giây — "
-            f"đã đặt {len(outcome['result'].scheduled)}/{len(exams)} môn."
-        )
+        n_placed = len(outcome["result"].scheduled)
+        n_unplaced = len(getattr(outcome["result"].stats, "unplaced_exam_ids", None) or [])
+        if n_unplaced:
+            st.warning(
+                f"Chạy xong trong {outcome['result'].stats.elapsed_seconds:.1f}s — "
+                f"**{n_unplaced} môn chưa có lịch** ({n_placed}/{len(exams)} môn đã xếp). "
+                "Xem tab Tổng quan → bảng «Môn chưa xếp»."
+            )
+        else:
+            st.success(
+                f"Xếp lịch hoàn tất trong {outcome['result'].stats.elapsed_seconds:.1f}s — "
+                f"đã đặt {n_placed}/{len(exams)} môn."
+            )
     except Exception as exc:  # noqa: BLE001
         st.error(f"❌ Lỗi khi xếp lịch: {exc}")
         st.exception(exc)
@@ -550,6 +625,11 @@ room_report = outcome["room_report"]
 session_labels = state["session_labels"]
 student_name_map = state["student_name_map"]
 
+unplaced_diag = list(getattr(result, "unplaced_diagnostics", None) or [])
+unplaced_ids = list(getattr(result.stats, "unplaced_exam_ids", None) or [])
+if not unplaced_ids and unplaced_diag:
+    unplaced_ids = [d.exam_id for d in unplaced_diag]
+
 tabs = st.tabs(
     [
         "📊 Tổng quan & KPI",
@@ -564,6 +644,13 @@ tabs = st.tabs(
 # ---- Tab 1: Tổng quan & KPI ----
 with tabs[0]:
     st.subheader("Tóm tắt")
+    if unplaced_ids:
+        st.error(
+            f"**CẢNH BÁO NGHIÊM TRỌNG — {len(unplaced_ids)} môn chưa có lịch thi** "
+            f"({len(result.scheduled)}/{result.stats.num_exams} môn đã xếp). "
+            "Sinh viên đăng ký các môn này **không có ngày/giờ thi** trong file xuất ra. "
+            "Không được coi là «xếp xong»."
+        )
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Môn đã xếp", f"{len(result.scheduled)} / {result.stats.num_exams}")
     c2.metric("Sinh viên", f"{result.stats.num_students:,}")
@@ -586,6 +673,18 @@ with tabs[0]:
 
     _show_hoc_phan_prep_hard_errors(kpi)
 
+    if kpi.prep_violation_students_year1 or kpi.prep_violation_count_year1:
+        ck = getattr(kpi, "newest_cohort_code", 0) or 0
+        st.info(
+            f"**SV năm 1 (niên khóa {ck:02d}):** {kpi.prep_violation_students_year1:,} SV / "
+            f"{kpi.prep_violation_count_year1:,} cặp **chưa đủ ngày ôn** — mục tiêu **0**. "
+            f"(Thi cùng ngày vẫn được phép; KPI đếm cặp môn liên tiếp mà khoảng ôn thực tế < yêu cầu.)"
+        )
+    elif getattr(kpi, "newest_cohort_code", 0):
+        st.success(
+            f"Niên khóa năm 1 (mã {kpi.newest_cohort_code:02d}): không ghi nhận SV vi phạm ngày ôn."
+        )
+
     c5, c6, c7, c8 = st.columns(4)
     c5.metric("Phương thức giải", hien_thi_phuong_thuc(result.stats.method))
     c6.metric("Thời gian giải", f"{result.stats.elapsed_seconds:.1f} giây")
@@ -598,6 +697,13 @@ with tabs[0]:
         load_df = pd.DataFrame(kpi.by_day_load, columns=["Ngày", "TổngSV"])
         st.bar_chart(load_df.set_index("Ngày"))
 
+    if unplaced_diag:
+        st.markdown("### Môn chưa xếp — nguyên nhân & gợi ý")
+        st.dataframe(
+            unplaced_to_dataframe(unplaced_diag),
+            use_container_width=True,
+            hide_index=True,
+        )
     if result.stats.relaxations:
         st.warning("Hệ thống đã tự nới ràng buộc:\n\n" + "\n".join(f"- {r}" for r in result.stats.relaxations))
     if result.stats.notes:
@@ -644,7 +750,9 @@ with tabs[1]:
     st.dataframe(type_df, use_container_width=True, hide_index=True)
 
     st.markdown("**Danh sách vi phạm nghỉ ôn (tóm tắt)**")
-    vios_df = violations_to_dataframe(violations)
+    vios_df = violations_to_dataframe(
+        violations, newest_cohort_code=getattr(kpi, "newest_cohort_code", 0) or 0
+    )
     if vios_df.empty:
         st.success("Không có vi phạm ngày ôn.")
     else:
@@ -824,6 +932,10 @@ with tabs[5]:
                         cfg.get("weekend_large_course_min_students", 0)
                     ),
                     spread_prep_factor=float(cfg.get("spread_prep_factor", 1.0)),
+                    student_cohort=state.get("student_cohort"),
+                    student_cohort_codes=state.get("student_cohort_codes"),
+                    year1_cohort_anchor=int(cfg.get("year1_cohort_anchor", 0) or 0),
+                    year1_allow_same_day=bool(cfg.get("year1_allow_same_day", True)),
                 )
                 state["outcome"] = new_outcome
                 st.session_state["scheduler_data"] = state
@@ -836,7 +948,9 @@ with tabs[5]:
 st.markdown("---")
 st.subheader("📦 Xuất file Excel")
 schedule_df = schedule_to_dataframe(result.scheduled, exams)
-vios_df = violations_to_dataframe(violations)
+vios_df = violations_to_dataframe(
+    violations, newest_cohort_code=getattr(kpi, "newest_cohort_code", 0) or 0
+)
 student_df = student_view_dataframe(result.scheduled, exams, student_name_map)
 
 kpi_rows = [
@@ -848,6 +962,15 @@ kpi_rows = [
     ("Ô thời gian đã dùng", kpi.slots_used),
     ("Tổng số ô thời gian", result.stats.num_slots),
     ("Số cặp môn thiếu nghỉ ôn (ước lượng)", kpi.prep_violation_count),
+    (
+        f"Cặp vi phạm ôn — SV niên khóa {getattr(kpi, 'newest_cohort_code', 0) or 0:02d}",
+        kpi.prep_violation_count_year1,
+    ),
+    (
+        f"SV niên khóa {getattr(kpi, 'newest_cohort_code', 0) or 0:02d} vi phạm ôn",
+        kpi.prep_violation_students_year1,
+    ),
+    ("Niên khóa SV năm 1 (cấu hình)", getattr(kpi, "newest_cohort_code", 0)),
     ("Số cặp thi cùng ngày (0 ngày nghỉ)", kpi.same_day_violation_count),
     ("Số SV bị vi phạm cùng-ngày", kpi.same_day_violation_students),
     ("Khoảng ôn trung bình của các cặp vi phạm (ngày)", round(kpi.avg_prep_gap, 2)),
@@ -856,10 +979,13 @@ kpi_rows = [
     ("Trung bình SV / ca", round(kpi.avg_students_per_slot, 1)),
     ("Cao nhất SV / ca", kpi.max_students_per_slot),
 ]
+if unplaced_ids:
+    kpi_rows.insert(0, ("CẢNH BÁO: Số môn chưa có lịch thi", len(unplaced_ids)))
 for msg in getattr(kpi, "prep_prefix_hard_errors", None) or []:
     kpi_rows.append(("Cảnh báo học phần: >10% SV thiếu nghỉ ôn", msg))
 
-excel_bytes = to_excel_bytes(schedule_df, vios_df, student_df, kpi_rows)
+unplaced_df = unplaced_to_dataframe(unplaced_diag) if unplaced_diag else None
+excel_bytes = to_excel_bytes(schedule_df, vios_df, student_df, kpi_rows, unplaced_df=unplaced_df)
 st.download_button(
     "⬇️ Tải file kết quả (Excel)",
     data=excel_bytes,

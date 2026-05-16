@@ -91,7 +91,7 @@ Hệ thống lấy `min(Ngày BD)` → `max(Ngày kết thúc)` làm cửa sổ.
 
 Hệ thống tự suy luận:
 - `CourseID` từ 12 ký tự đầu của `MalopHP`.
-- **Khoa_nhom** = **4 ký tự cuối** `MalopHP`: hai **môn khác học phần** mà cùng một hậu tố này **không được xếp thi cùng một ngày** (Greedy, LNS và CP-SAT đều áp). Các **ca tách cùng một học phần** (cùng 7 ký tự đầu MalopHP hoặc cùng `CourseID`) được **miễn** quy tắc này giữa các ca với nhau.
+- **Khoa_nhom** = **4 ký tự cuối** `MalopHP`: hai **môn khác học phần** mà cùng hậu tố **không thi cùng một ngày**. Ca tách cùng học phần được **miễn**.
 - `ExamType`: `theory` / `oral` / `computer` từ tên môn (qua từ khoá).
 - **Môn thi chung**: môn có từ **3 lớp học phần trở lên** (ngưỡng cấu hình được, mặc định ≥3) → gộp một đề thi chung (trừ khi tách môn lớn tạo thêm ca).
 
@@ -127,13 +127,13 @@ Phần này mô tả **đúng hành vi hiện tại** của app (Streamlit `app.
 - Greedy / LNS / CP-SAT gán **ô thời gian (slot) cho từng ca**, theo thứ tự ưu tiên và đồ thị xung đột.
 - **Sinh viên** dùng để: biết hai ca nào **không được trùng slot** (chung SV); giới hạn **số môn/SV/ngày**; tính **ngày ôn** (prep) mềm/cứng; không có vòng lặp «lần lượt mỗi SV rồi tìm chỗ».
 
-### 3.2 MalopHP: 7 ký tự đầu, 4 ký tự cuối, và 2 số «khóa»
+### 3.2 MalopHP: cấu trúc vị trí ký tự
 
-| Khái niệm | Cách lấy | Dùng cho |
-|---|---|---|
-| Tiền tố học phần | **7 ký tự đầu** `MalopHP` | Gom «môn đông» theo ngưỡng SV; các **ca tách cùng học phần** phải cùng **buổi** (sáng/chiều) khi bật tách đề. |
-| **Khoa_nhom** | **4 ký tự cuối** `MalopHP` | Hai **học phần khác nhau** có cùng hậu tố → **không thi cùng một ngày** (cứng: Greedy, LNS, CP-SAT). **Miễn** giữa các ca **cùng học phần** (cùng 7 ký tự đầu hoặc cùng `CourseID`). |
-| **Chỉ số khóa (sóng xếp)** | **2 ký tự đầu** của 4 ký tự cuối, phải là chữ số (vd `2510` → `25`) | Greedy xếp theo **sóng**: hết khóa mới nhất trong đợt (≈ năm 1, mã lớn) rồi mới tới khóa cũ; trong sóng: `priority` → bậc xung đột → quy mô SV. |
+| Khái niệm | Cách lấy | Ví dụ `104181025102122` | Dùng cho |
+|---|---|---|---|
+| Tiền tố học phần | **7 ký tự đầu** | `1041810` | Môn đông; ca tách cùng HP → cùng buổi. |
+| **Niên khóa** | **2 chữ số đầu** của 4 ký tự cuối | `21` | Sóng xếp; ôn cứng với SV khóa lớn nhất (`Ma_khoa_SV`). |
+| **Khoa_nhom** | **4 ký tự cuối** | `2122` | Hai môn khác HP cùng hậu tố → **không cùng ngày**. |
 
 ### 3.3 Ngày ôn (prep-day) — một quy tắc thống nhất
 

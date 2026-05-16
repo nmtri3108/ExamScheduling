@@ -25,7 +25,13 @@ from .diagnostics import (
     exam_khoa_nhom_keys,
     same_course_khoa_nhom_waiver,
 )
-from .diagnostics import prep_days_required_for_pair
+from .diagnostics import (
+    build_student_cohort_map,
+    is_year1_anchor_student,
+    prep_days_required_for_pair,
+    prep_hard_gap_days_for_pair,
+    resolve_year1_cohort_anchor,
+)
 from .heuristic import HeuristicResult, lns_improve, schedule_greedy
 from .models import (
     Exam,
@@ -265,6 +271,10 @@ def solve(
     progress_cb: Optional[Callable[[int, str], None]] = None,
     weekend_large_course_min_students: int = 0,
     spread_prep_factor: float = 1.0,
+    student_cohort: Dict[str, int] | None = None,
+    student_cohort_codes: Dict[str, str] | None = None,
+    year1_cohort_anchor: int = 0,
+    year1_allow_same_day: bool = True,
 ) -> SolveResult:
     """Entry point chính.
 
@@ -313,6 +323,10 @@ def solve(
         weekend_large_course_min_students=weekend_large_course_min_students,
         prefix_student_totals=prefix_totals,
         spread_prep_factor=spread_prep_factor,
+        student_cohort=student_cohort,
+        student_cohort_codes=student_cohort_codes,
+        year1_cohort_anchor=year1_cohort_anchor,
+        year1_allow_same_day=year1_allow_same_day,
     )
     relaxations.extend(greedy.relaxations)
 
@@ -352,6 +366,10 @@ def solve(
                 progress_cb=progress,
                 weekend_large_course_min_students=weekend_large_course_min_students,
                 prefix_student_totals=prefix_totals,
+                student_cohort=student_cohort,
+                student_cohort_codes=student_cohort_codes,
+                year1_cohort_anchor=year1_cohort_anchor,
+                year1_allow_same_day=year1_allow_same_day,
             )
             if improved and improved != final_assignment:
                 final_assignment = improved
@@ -486,15 +504,19 @@ def solve(
             ("Đã chạy thêm bước tối ưu SAT." if cpsat_used else "Không chạy bước SAT (đủ tốt hoặc hết thời gian)."),
         ],
     )
+    stats.unplaced_exam_ids = list(greedy.unplaced)
     if greedy.unplaced:
         stats.notes.append(
-            f"CẢNH BÁO: {len(greedy.unplaced)} môn vẫn chưa có slot — "
-            "kiểm tra file kế hoạch / cấu hình ca thi."
+            f"CẢNH BÁO NGHIÊM TRỌNG: {len(greedy.unplaced)} môn KHÔNG có lịch thi — "
+            "sinh viên đăng ký các môn này sẽ không biết ngày giờ thi. "
+            "Xem tab Tổng quan → «Môn chưa xếp» và sheet Excel «Mon_chua_xep»."
         )
     else:
         stats.notes.append("Đã xếp đủ 100% môn (có thể đã nới một số ràng buộc — xem log relaxations).")
 
-    return SolveResult(scheduled=scheduled, stats=stats, violations=[])
+    result = SolveResult(scheduled=scheduled, stats=stats, violations=[])
+    result.unplaced_diagnostics = list(getattr(greedy, "unplaced_diagnostics", None) or [])
+    return result
 
 
 def detect_prep_violations(
@@ -503,8 +525,17 @@ def detect_prep_violations(
     student_name_map: Dict[str, str],
     prep_day_per_credit: float = 0.6,
     min_prep_days: float = 0.0,
+    student_cohort: Dict[str, int] | None = None,
+    student_cohort_codes: Dict[str, str] | None = None,
+    year1_cohort_anchor: int = 0,
+    year1_allow_same_day: bool = True,
 ) -> List[PrepViolation]:
     exam_by_id = {e.exam_id: e for e in exams}
+    code_map = student_cohort_codes or {}
+    cohort_map = student_cohort if student_cohort else build_student_cohort_map(
+        exams, student_cohort_codes=code_map or None
+    )
+    anchor = resolve_year1_cohort_anchor(year1_cohort_anchor, exams, code_map)
     student_exams = defaultdict(list)
     for item in scheduled:
         exam = exam_by_id[item.exam_id]
@@ -514,19 +545,32 @@ def detect_prep_violations(
     violations: List[PrepViolation] = []
     for sid, entries in student_exams.items():
         ordered = sorted(entries, key=lambda x: x[0])
+        y1 = anchor > 0 and is_year1_anchor_student(sid, code_map, anchor)
         for i in range(1, len(ordered)):
             prev_date, prev_exam_id = ordered[i - 1]
             curr_date, curr_exam_id = ordered[i]
             prev_exam = exam_by_id[prev_exam_id]
             curr_exam = exam_by_id[curr_exam_id]
+            same_day = prev_date == curr_date
             required = round(
                 prep_days_required_for_pair(
                     prev_exam, curr_exam, prep_day_per_credit, min_prep_days
                 ),
                 2,
             )
+            min_gap = prep_hard_gap_days_for_pair(
+                prev_exam,
+                curr_exam,
+                prep_day_per_credit,
+                min_prep_days,
+                year1_allow_same_day=year1_allow_same_day,
+                for_year1_student=y1,
+                same_calendar_day=same_day,
+            )
             actual = (curr_date - prev_date).days
-            if actual + 1e-9 < required:
+            if min_gap <= 0 and same_day and y1 and year1_allow_same_day:
+                continue
+            if actual + 1e-9 < min_gap:
                 violations.append(
                     PrepViolation(
                         student_id=sid,
@@ -536,6 +580,8 @@ def detect_prep_violations(
                         required_days=required,
                         actual_days=float(actual),
                         later_exam_id=curr_exam_id,
+                        student_cohort=int(cohort_map.get(str(sid), 0) or 0),
+                        student_cohort_code=code_map.get(str(sid), ""),
                     )
                 )
     return violations

@@ -91,6 +91,9 @@ class PrepViolation:
     actual_days: float
     # Môn thi sau (cần khoảng ôn) — dùng để gom theo 7 ký tự đầu MalopHP
     later_exam_id: str = ""
+    # Mã khóa: 2 chữ số đầu của 4 ký tự cuối MalopHP (vd …2122 → 21)
+    student_cohort: int = 0
+    student_cohort_code: str = ""
 
 
 @dataclass
@@ -107,6 +110,7 @@ class SolveStats:
     days_used: int = 0
     relaxations: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
+    unplaced_exam_ids: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -114,3 +118,4 @@ class SolveResult:
     scheduled: List[ScheduledExam]
     stats: SolveStats
     violations: List[PrepViolation] = field(default_factory=list)
+    unplaced_diagnostics: List = field(default_factory=list)  # List[UnplacedExamDiagnostic]

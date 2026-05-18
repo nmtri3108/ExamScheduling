@@ -113,17 +113,33 @@ def load_registrations(reg_path: str | Path) -> List[Registration]:
     if missing:
         raise ValueError(f"File đăng ký thiếu cột: {sorted(missing)}")
 
+    _FMT_COL_FOLDED = frozenset(
+        {
+            "mahinhthuc",
+            "mahinhthucthi",
+            "hinhthucthi",
+            "loaihinhthi",
+            "loaihinhthucthi",
+        }
+    )
     fmt_col = None
-    for candidate in ("MaHinhThuc", "Ma_hinh_thuc", "HinhThucThi", "LoaiHinhThi"):
-        if candidate in df.columns:
-            fmt_col = candidate
+    for col in df.columns:
+        if _fold_header_label(col) in _FMT_COL_FOLDED:
+            fmt_col = col
             break
+    if fmt_col is None:
+        for candidate in ("MaHinhThuc", "Ma_hinh_thuc", "HinhThucThi", "LoaiHinhThi"):
+            if candidate in df.columns:
+                fmt_col = candidate
+                break
 
     use_cols = list(required_cols)
     if fmt_col:
         use_cols.append(fmt_col)
 
     df = df[use_cols].copy()
+    if fmt_col:
+        df = df.rename(columns={fmt_col: "MaHinhThuc"})
     df = df.dropna(subset=["MaHS", "MalopHP", "TenLopHP"])
     df["SoTC"] = pd.to_numeric(df["SoTC"], errors="coerce").fillna(2.0)
     df["MaHS"] = df["MaHS"].astype(str).str.strip()
@@ -136,14 +152,7 @@ def load_registrations(reg_path: str | Path) -> List[Registration]:
     for row in df.itertuples(index=False):
         fmt_val = None
         if fmt_col:
-            raw = getattr(row, fmt_col, None)
-            if raw is not None and str(raw).strip() != "" and str(raw).strip().lower() != "nan":
-                try:
-                    v = int(float(str(raw).strip()))
-                    if v in (1, 2, 3):
-                        fmt_val = v
-                except (TypeError, ValueError):
-                    fmt_val = None
+            fmt_val = _parse_exam_format_code(getattr(row, "MaHinhThuc", None))
         rows.append(
             Registration(
                 student_id=row.MaHS,
@@ -392,6 +401,30 @@ _ROOM_HEADER_ALIASES: Tuple[Tuple[str, frozenset[str]], ...] = (
 )
 
 
+def _parse_exam_format_code(value: object) -> int | None:
+    """Đọc mã hình thức thi 1/2/3 từ ô số hoặc nhãn tiếng Việt (Loại thi)."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    raw = str(value).strip()
+    if not raw or raw.lower() in ("nan", "none", "-", "—"):
+        return None
+    s = raw.lower()
+    if s in ("1", "1.0"):
+        return 1
+    if s in ("2", "2.0"):
+        return 2
+    if s in ("3", "3.0"):
+        return 3
+    s_fold = _fold_header_label(raw)
+    if s_fold in ("tuluuan", "lythuyet", "lth"):
+        return 1
+    if s_fold in ("tracnghiem", "maytinh", "phongmay", "tn"):
+        return 2
+    if s_fold in ("vandap", "pbl", "dodan", "oral"):
+        return 3
+    return None
+
+
 def _normalize_room_type_cell(value: object) -> str:
     """Giá trị ô loại phòng: cùng bộ mã 1/2/3 như hình thức thi (1=tự luận, 2=TN, 3=vấn đáp)
     hoặc chữ theory / computer / any (dùng nội bộ khi phân phòng).
@@ -408,7 +441,7 @@ def _normalize_room_type_cell(value: object) -> str:
     if s in ("2", "2.0") or s_fold in ("tracnghiem", "maytinh", "phongmay", "tn"):
         return "computer"
     if s in ("3", "3.0") or s_fold in ("vandap", "pbl", "dodan", "oral"):
-        return "any"
+        return "oral"
     return s
 
 
@@ -459,15 +492,16 @@ def load_rooms(rooms_path: str | Path | None) -> List[Room]:
             continue
         if capacity <= 0:
             continue
-        room_type = "any"
-        if hasattr(row, "RoomType"):
-            room_type = _normalize_room_type_cell(getattr(row, "RoomType", None))
+        fmt_raw = getattr(row, "RoomType", None) if hasattr(row, "RoomType") else None
+        room_format_code = _parse_exam_format_code(fmt_raw)
+        room_type = _normalize_room_type_cell(fmt_raw)
         rows.append(
             Room(
                 room_id=str(row.RoomID).strip(),
                 location=str(row.Location).strip() if row.Location is not None and not pd.isna(row.Location) else "",
                 capacity=capacity,
                 room_type=room_type,
+                room_format_code=room_format_code,
             )
         )
     return rows

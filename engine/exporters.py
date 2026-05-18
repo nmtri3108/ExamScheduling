@@ -5,6 +5,7 @@ from typing import Dict, List
 
 import pandas as pd
 
+from .diagnostics import cohort_code_from_malop
 from .i18n import hien_thi_loai_hinh
 from .models import Exam, PrepViolation, ScheduledExam
 
@@ -34,6 +35,16 @@ def _exam_malophp_cell(exam: Exam | None) -> str:
     return ", ".join(sorted(parts)) if parts else ""
 
 
+def _exam_nien_khoa_cell(exam: Exam | None) -> str:
+    """Niên khóa: 2 ký tự đầu của 4 ký tự cuối MalopHP (theo từng lớp trong ca thi)."""
+    if exam is None:
+        return ""
+    codes = sorted(
+        {c for s in exam.section_ids if (c := cohort_code_from_malop(s))}
+    )
+    return ", ".join(codes) if codes else ""
+
+
 def schedule_to_dataframe(
     scheduled: List[ScheduledExam],
     exams: List[Exam] | None = None,
@@ -47,11 +58,13 @@ def schedule_to_dataframe(
         pfx7 = str(getattr(ex, "course_prefix_7", "") or "") if ex else ""
         pri = int(ex.priority) if ex else None
         malop = _exam_malophp_cell(ex)
+        nien_khoa = _exam_nien_khoa_cell(ex)
         codes = list(getattr(s, "room_split_codes", None) or [])
         rows.append(
             {
                 "Ma_ca_thi": s.exam_id,
                 "MalopHP": malop,
+                "Nien_khoa": nien_khoa,
                 "Ma_hoc_phan": s.course_id,
                 "Ten_mon": s.course_name,
                 "So_tin_chi": tin_chi,
@@ -103,6 +116,7 @@ def student_view_dataframe(
     scheduled: List[ScheduledExam],
     exams: List[Exam],
     student_name_map: Dict[str, str],
+    student_cohort_codes: Dict[str, str] | None = None,
 ) -> pd.DataFrame:
     """Lịch theo từng sinh viên — dùng cho cả UI lẫn xuất file."""
     exam_map = {e.exam_id: e for e in exams}
@@ -114,12 +128,18 @@ def student_view_dataframe(
         for sid in exam.student_ids:
             rid, split_code = _student_room_and_split_code(item, sid)
             phong_cell = rid if rid else ", ".join(item.room_ids)
+            cohort = ""
+            if student_cohort_codes:
+                cohort = str(student_cohort_codes.get(sid, "") or "").strip()
+            if not cohort and exam.section_ids:
+                cohort = cohort_code_from_malop(exam.section_ids[0])
             rows.append(
                 {
                     "Ma_sinh_vien": sid,
                     "Ten_sinh_vien": student_name_map.get(sid, ""),
                     "Ma_ca_thi": item.exam_id,
                     "MalopHP": _exam_malophp_cell(exam),
+                    "Nien_khoa": cohort,
                     "Ma_hoc_phan": exam.course_id,
                     "Ten_mon": exam.course_name,
                     "So_tin_chi": float(exam.credits),
@@ -152,6 +172,7 @@ def exam_view_dataframe(scheduled: List[ScheduledExam], exams: List[Exam]) -> pd
             {
                 "Ma_ca_thi": item.exam_id,
                 "MalopHP": _exam_malophp_cell(exam),
+                "Nien_khoa": _exam_nien_khoa_cell(exam),
                 "Ma_hoc_phan": item.course_id,
                 "Ten_mon": item.course_name,
                 "So_tin_chi": float(exam.credits),

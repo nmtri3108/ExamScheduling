@@ -40,7 +40,9 @@ class Room:
     room_id: str
     location: str
     capacity: int
-    room_type: str = "any"   # any | theory | computer (mở rộng tương lai)
+    room_type: str = "any"   # any | theory | computer | oral (gợi ý nội bộ)
+    # Mã ghép hình thức thi từ file phòng: 1=tự luận/lý thuyết, 2=trắc nghiệm, 3=vấn đáp
+    room_format_code: int | None = None
 
 
 @dataclass

@@ -794,7 +794,12 @@ with tabs[2]:
 # ---- Tab 4: Lịch theo SV ----
 with tabs[3]:
     st.subheader("Lịch thi theo sinh viên")
-    student_df = student_view_dataframe(result.scheduled, exams, student_name_map)
+    student_df = student_view_dataframe(
+        result.scheduled,
+        exams,
+        student_name_map,
+        student_cohort_codes=state.get("student_cohort_codes"),
+    )
     if student_df.empty:
         st.warning("Chưa có dữ liệu.")
     else:
@@ -951,7 +956,12 @@ schedule_df = schedule_to_dataframe(result.scheduled, exams)
 vios_df = violations_to_dataframe(
     violations, newest_cohort_code=getattr(kpi, "newest_cohort_code", 0) or 0
 )
-student_df = student_view_dataframe(result.scheduled, exams, student_name_map)
+student_df = student_view_dataframe(
+    result.scheduled,
+    exams,
+    student_name_map,
+    student_cohort_codes=state.get("student_cohort_codes"),
+)
 
 kpi_rows = [
     ("Phương thức giải", hien_thi_phuong_thuc(result.stats.method)),

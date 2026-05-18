@@ -65,25 +65,68 @@ def _partition_students_across_rooms(student_ids: List[str], assigned: List[Room
 
 
 _THEORY_TYPES = frozenset(
-    {"theory", "ly_thuyet", "ly_thuyết", "classroom", "phong_ly_thuyet", "phòng_lý_thuyết", "any", ""}
+    {
+        "theory",
+        "ly_thuyet",
+        "ly_thuyết",
+        "classroom",
+        "phong_ly_thuyet",
+        "phòng_lý_thuyết",
+        "any",
+        "",
+    }
 )
 _COMP_TYPES = frozenset(
     {"computer", "may_tinh", "máy_tính", "lab", "phong_may", "phòng_máy", "any", ""}
 )
+_ORAL_TYPES = frozenset({"oral", "vandap", "vấn_đáp", "pbl", "any", ""})
 
 
 def _norm_room_type(rt: str) -> str:
     return str(rt or "any").strip().lower()
 
 
+def _room_format_code(room: Room) -> int | None:
+    code = getattr(room, "room_format_code", None)
+    if code is not None:
+        try:
+            v = int(code)
+            return v if v in (1, 2, 3) else None
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _room_matches_exam_format(fmt: int, room: Room) -> bool:
+    """Khớp mã ghép hình thức thi (1/2/3) giữa ca thi và phòng; không có mã → gợi ý theo loại phòng."""
+    code = _room_format_code(room)
+    if code is not None:
+        return code == int(fmt)
+    rt = _norm_room_type(room.room_type)
+    if fmt == 2:
+        return rt in _COMP_TYPES
+    if fmt == 3:
+        return rt in _ORAL_TYPES
+    if fmt == 1:
+        return rt in _THEORY_TYPES
+    return True
+
+
 def _eligible_rooms(fmt: int, pool: List[Room]) -> List[Room]:
     if not pool:
         return []
+    matched = [r for r in pool if _room_matches_exam_format(fmt, r)]
+    if matched:
+        return matched
+    # Không còn phòng đúng mã: nới theo quy tắc cũ (theory/computer/any) để tránh treo lịch
     if fmt == 2:
         out = [r for r in pool if _norm_room_type(r.room_type) in _COMP_TYPES]
         return out or list(pool)
     if fmt == 1:
         out = [r for r in pool if _norm_room_type(r.room_type) in _THEORY_TYPES]
+        return out or list(pool)
+    if fmt == 3:
+        out = [r for r in pool if _norm_room_type(r.room_type) in _ORAL_TYPES]
         return out or list(pool)
     return list(pool)
 

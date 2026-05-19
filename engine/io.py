@@ -11,8 +11,10 @@ from .diagnostics import (
     build_student_cohort_map,
     cohort_code_from_malop,
     cohort_index_from_malop,
+    plan_bucket_for_section,
 )
 from .models import Exam, Invigilator, Registration, Room, ScheduleWindow
+from .plan_windows import load_khoa_lop_plan, plan_to_date_map
 
 
 PBL_KEYWORDS = (
@@ -86,6 +88,7 @@ def _course_prefix_7(section_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 def load_schedule_window(plan_path: str | Path) -> ScheduleWindow:
+    """Khung ngày toàn đợt = min–max trên file; mỗi Khoa_lop* có cửa sổ riêng trong ``khoa_lop_windows``."""
     df = pd.read_excel(plan_path, sheet_name=0)
     needed = {"Ngày BD", "Ngày kết thúc"}
     if not needed.issubset(df.columns):
@@ -99,7 +102,19 @@ def load_schedule_window(plan_path: str | Path) -> ScheduleWindow:
         raise ValueError("Không đọc được ngày bắt đầu/kết thúc từ file kế hoạch thi.")
     if end_date < start_date:
         raise ValueError("Ngày kết thúc trước ngày bắt đầu trong file kế hoạch.")
-    return ScheduleWindow(start_date=start_date.date(), end_date=end_date.date())
+
+    khoa_lop_windows: dict = {}
+    try:
+        plan = load_khoa_lop_plan(plan_path)
+        khoa_lop_windows = plan_to_date_map(plan)
+    except ValueError:
+        pass
+
+    return ScheduleWindow(
+        start_date=start_date.date(),
+        end_date=end_date.date(),
+        khoa_lop_windows=khoa_lop_windows,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +186,7 @@ def build_exams(
     prep_day_per_credit: float = 0.6,
     common_section_threshold: int = 3,
     max_exam_size: int | None = None,
+    khoa_lop_windows: Dict[str, tuple] | None = None,
 ) -> Tuple[List[Exam], Dict[str, Registration], Dict[str, int], Dict[str, str]]:
     """Tạo danh sách Exam từ Registration.
 
@@ -209,10 +225,22 @@ def build_exams(
         thr = 3
     common_exam_courses = set(section_counts[section_counts >= thr].index.tolist())
 
-    df["exam_group"] = df.apply(
-        lambda x: x["course_norm"] if x["course_norm"] in common_exam_courses else x["section_id"],
-        axis=1,
-    )
+    if khoa_lop_windows:
+        df["plan_bucket"] = df["section_id"].map(
+            lambda s: plan_bucket_for_section(s, khoa_lop_windows)
+        )
+
+        def _exam_group_key(row: pd.Series) -> object:
+            if row["course_norm"] in common_exam_courses:
+                return (row["course_norm"], row["plan_bucket"])
+            return row["section_id"]
+
+        df["exam_group"] = df.apply(_exam_group_key, axis=1)
+    else:
+        df["exam_group"] = df.apply(
+            lambda x: x["course_norm"] if x["course_norm"] in common_exam_courses else x["section_id"],
+            axis=1,
+        )
 
     exams: List[Exam] = []
     next_idx = 1

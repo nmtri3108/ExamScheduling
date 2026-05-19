@@ -6,7 +6,7 @@ Mục tiêu:
 """
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import date, timedelta
 from collections import defaultdict
 from dataclasses import dataclass, field
 from math import ceil
@@ -129,6 +129,36 @@ def diagnose(
             report.warnings.append(
                 f"min_prep_days={min_prep_days} có thể không đủ chỗ: SV nặng nhất cần "
                 f"~{span:.1f} ngày khoảng cách trong khi đợt chỉ {report.num_days} ngày."
+            )
+
+    if window.khoa_lop_windows:
+        no_plan_days = 0
+        multi_window = 0
+        for e in exams:
+            if not exam_allowed_day_indices(e, window):
+                no_plan_days += 1
+            keys = exam_khoa_nhom_keys(e)
+            if len(keys) > 1:
+                wins = {
+                    window.khoa_lop_windows[k]
+                    for k in keys
+                    if k in window.khoa_lop_windows
+                }
+                if len(wins) > 1:
+                    multi_window += 1
+        if no_plan_days:
+            report.errors.append(
+                f"{no_plan_days} ca thi không có ngày hợp lệ trong Ke_hoach_thi "
+                "(lớp khác đợt bị gom chung hoặc thiếu mã Khoa_lop*)."
+            )
+        elif multi_window:
+            report.warnings.append(
+                f"{multi_window} ca vẫn gom nhiều đợt ngày khác nhau — kiểm tra tách môn / đăng ký."
+            )
+        else:
+            report.info.append(
+                f"Mỗi ca thi nằm trong một đợt Khoa_lop* "
+                f"({len(window.khoa_lop_windows)} mã trong kế hoạch)."
             )
 
     # Sức chứa phòng + môn quá lớn
@@ -373,16 +403,44 @@ def prep_hard_gap_days_for_pair(
     for_year1_student: bool = False,
     same_calendar_day: bool = False,
 ) -> float:
-    """Khoảng lịch tối thiểu khi **đặt cứng** (greedy/LNS).
+    """Khoảng lịch tối thiểu (số ngày) giữa hai **ngày thi khác nhau** — dùng ``ceil`` để khớp lịch.
 
-  SV khóa năm 1 + ``year1_allow_same_day``: **được thi cùng ngày** (không chặn ôn cùng ngày);
-  giữa **hai ngày thi khác nhau** cần đủ ngày ôn theo tín chỉ (ngày ôn > 0).
+    SV khóa năm 1 + ``year1_allow_same_day``: được thi **cùng ngày** (khoảng cách 0).
     """
     if year1_allow_same_day and for_year1_student and same_calendar_day:
         return 0.0
-    return prep_days_required_for_pair(
+    return float(
+        min_prep_index_gap_between(
+            exam_a,
+            exam_b,
+            prep_day_per_credit,
+            min_prep_days,
+            year1_allow_same_day=year1_allow_same_day,
+            for_year1_student=for_year1_student,
+            same_calendar_day=same_calendar_day,
+        )
+    )
+
+
+def min_prep_index_gap_between(
+    exam_a: Exam,
+    exam_b: Exam,
+    prep_day_per_credit: float,
+    min_prep_days: float = 0.0,
+    *,
+    year1_allow_same_day: bool = True,
+    for_year1_student: bool = False,
+    same_calendar_day: bool = False,
+) -> int:
+    """Số ngày lịch tối thiểu giữa hai ngày (chỉ số ngày hoặc chênh lệch date)."""
+    if year1_allow_same_day and for_year1_student and same_calendar_day:
+        return 0
+    req = prep_days_required_for_pair(
         exam_a, exam_b, prep_day_per_credit, min_prep_days
     )
+    if req <= 0:
+        return 0
+    return int(ceil(req))
 
 
 def min_calendar_gap_days_between_exams(
@@ -392,10 +450,35 @@ def min_calendar_gap_days_between_exams(
     min_prep_days: float = 0.0,
 ) -> int:
     """Số ngày lịch tối thiểu giữa hai ngày thi (|day1-day2| phải ≥ giá trị này)."""
-    req = prep_days_required_for_pair(exam_a, exam_b, prep_day_per_credit, min_prep_days)
-    if req <= 0:
-        return 0
-    return int(ceil(req))
+    return min_prep_index_gap_between(
+        exam_a, exam_b, prep_day_per_credit, min_prep_days
+    )
+
+
+def prep_gap_violated(
+    day_gap: int,
+    exam_a: Exam,
+    exam_b: Exam,
+    prep_day_per_credit: float,
+    min_prep_days: float = 0.0,
+    *,
+    year1_allow_same_day: bool = True,
+    for_year1_student: bool = False,
+    same_calendar_day: bool = False,
+) -> bool:
+    """``day_gap`` = |day_index_a - day_index_b| hoặc (date_b - date_a).days."""
+    need = min_prep_index_gap_between(
+        exam_a,
+        exam_b,
+        prep_day_per_credit,
+        min_prep_days,
+        year1_allow_same_day=year1_allow_same_day,
+        for_year1_student=for_year1_student,
+        same_calendar_day=same_calendar_day,
+    )
+    if need <= 0:
+        return False
+    return day_gap < need
 
 
 def resolve_global_max_cohort(
@@ -547,6 +630,58 @@ def build_prefix_student_totals(exams: List[Exam]) -> Dict[str, int]:
     return {k: len(v) for k, v in by_pfx.items()}
 
 
+def plan_bucket_for_section(
+    section_id: str,
+    khoa_lop_windows: Dict[str, Tuple[date, date]],
+) -> Tuple[str, ...]:
+    """Khóa gom ca thi chung: cùng đợt ngày trong Ke_hoach_thi (hoặc từng mã ngoài kế hoạch)."""
+    kl = khoa_nhom_from_malop(section_id)
+    bounds = khoa_lop_windows.get(kl)
+    if bounds:
+        return ("plan", bounds[0].isoformat(), bounds[1].isoformat())
+    return ("noplan", kl)
+
+
+def exam_allowed_day_indices(exam: Exam, window: ScheduleWindow) -> frozenset[int]:
+    """Ngày được phép xếp ca thi theo giao Khoa_lop* trong kế hoạch (4 ký tự cuối MalopHP).
+
+    Nhiều lớp trong một ca: lấy **giao** các khoảng ngày. Mã lớp không có trong kế hoạch:
+    cho phép toàn khung min–max (đợt gộp).
+    """
+    if not window.khoa_lop_windows:
+        return frozenset(range(window.total_days))
+    keys = exam_khoa_nhom_keys(exam)
+    if not keys:
+        return frozenset(range(window.total_days))
+    start_dates: List[date] = []
+    end_dates: List[date] = []
+    for k in keys:
+        bounds = window.khoa_lop_windows.get(k)
+        if bounds is None:
+            return frozenset(range(window.total_days))
+        start_dates.append(bounds[0])
+        end_dates.append(bounds[1])
+    start = max(start_dates)
+    end = min(end_dates)
+    if start > end:
+        return frozenset()
+    d0 = (start - window.start_date).days
+    d1 = (end - window.start_date).days
+    return frozenset(d for d in range(window.total_days) if d0 <= d <= d1)
+
+
+def exam_plan_date_bounds(exam: Exam, window: ScheduleWindow) -> Tuple[date, date] | None:
+    """Khoảng ngày kế hoạch (giao) cho ca thi; ``None`` nếu không giao được."""
+    days = exam_allowed_day_indices(exam, window)
+    if not days:
+        return None
+    d0, d1 = min(days), max(days)
+    return (
+        window.start_date + timedelta(days=d0),
+        window.start_date + timedelta(days=d1),
+    )
+
+
 def weekday_at_day_index(window: ScheduleWindow, day_idx: int) -> int:
     """Thứ trong tuần của ô ngày `day_idx` (0=Thứ Hai … 6=Chủ nhật)."""
     return (window.start_date + timedelta(days=int(day_idx))).weekday()
@@ -594,8 +729,11 @@ def enumerate_feasible_slots_for_exam(
     if not sessions:
         return []
     totals = prefix_totals or {}
+    allowed_days = exam_allowed_day_indices(exam, window)
     slots: List[int] = []
     for d in range(window.total_days):
+        if d not in allowed_days:
+            continue
         if not relax_weekday_rule and weekend_large_min_students > 0:
             if not day_allowed_for_exam_weekday_rule(
                 exam, d, window, weekend_large_min_students, totals
@@ -608,6 +746,7 @@ def enumerate_feasible_slots_for_exam(
 
 _BLOCKER_VI = {
     "NO_SLOT": "Không có ô thời gian / ca thi trong cấu hình",
+    "KE_HOACH": "Ngày thi ngoài khoảng Khoa_lop* trong Ke_hoach_thi (hoặc giao đợt rỗng)",
     "WEEKDAY": "Quy tắc thứ (môn đông chỉ T7–CN; môn khác không Chủ nhật)",
     "CONFLICT": "Trùng sinh viên với ca đã xếp (cùng ô thời gian)",
     "YEAR1_PREP": "SV khóa năm 1: giữa hai ngày thi khác nhau chưa đủ ngày ôn theo tín chỉ",
@@ -621,6 +760,7 @@ _BLOCKER_VI = {
 
 _BLOCKER_PRIORITY = (
     "NO_SLOT",
+    "KE_HOACH",
     "WEEKDAY",
     "YEAR1_PREP",
     "CONFLICT",
@@ -743,9 +883,10 @@ def diagnose_unplaced_exams(
                 ex.exam_id, list(range(spd))
             )
             sessions = sorted({int(s) for s in sessions if 0 <= int(s) < spd})
-            if sessions:
+            plan_days = exam_allowed_day_indices(ex, window)
+            if sessions and plan_days:
                 slots = [
-                    d * spd + s for d in range(window.total_days) for s in sessions
+                    d * spd + s for d in sorted(plan_days) for s in sessions
                 ]
         return slots
 
@@ -779,9 +920,13 @@ def diagnose_unplaced_exams(
             relax_weekday_rule=False,
         )
         slots_all = _all_slots(ex)
+        plan_days = exam_allowed_day_indices(ex, window)
         counts: Dict[str, int] = defaultdict(int)
+        if not plan_days and window.khoa_lop_windows:
+            counts["KE_HOACH"] = 1
         if not slots_all:
-            counts["NO_SLOT"] = 1
+            if "KE_HOACH" not in counts:
+                counts["NO_SLOT"] = 1
         elif not slots_strict and slots_all:
             counts["WEEKDAY"] = len(slots_all)
 

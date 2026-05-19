@@ -27,6 +27,7 @@ from .diagnostics import (
     build_prefix_student_totals,
     diagnose_unplaced_exams,
     enumerate_feasible_slots_for_exam,
+    exam_allowed_day_indices,
     build_student_cohort_code_map,
     build_student_cohort_map,
     cohort_wave_index,
@@ -35,6 +36,8 @@ from .diagnostics import (
     is_year1_anchor_student,
     resolve_year1_cohort_anchor,
     prep_days_required_for_pair,
+    min_prep_index_gap_between,
+    prep_gap_violated,
     prep_hard_gap_days_for_pair,
     same_course_khoa_nhom_waiver,
     weekday_at_day_index,
@@ -65,12 +68,12 @@ def schedule_greedy(
     total_capacity: int | None = None,
     fixed_slots: Dict[str, int] | None = None,
     base_slots: Dict[str, int] | None = None,
-    balance_weight: float = 1.0,
+    balance_weight: float = 0.12,
     soft_slot_cap: int | None = None,
     session_half: List[int] | None = None,
     weekend_large_course_min_students: int = 0,
     prefix_student_totals: Dict[str, int] | None = None,
-    spread_prep_factor: float = 1.0,
+    spread_prep_factor: float = 2.4,
     student_cohort: Dict[str, int] | None = None,
     student_cohort_codes: Dict[str, str] | None = None,
     year1_cohort_anchor: int = 0,
@@ -119,6 +122,12 @@ def schedule_greedy(
     target_per_slot = total_student_demand / max(1, window.total_slots)
 
     relaxations: List[str] = []
+    if window.has_per_cohort_windows:
+        n_win = len({(a, b) for a, b in window.khoa_lop_windows.values()})
+        relaxations.append(
+            f"Kế hoạch thi theo Khoa_lop* (4 ký tự cuối MalopHP): {len(window.khoa_lop_windows)} lớp, "
+            f"{n_win} đợt ngày khác nhau; mỗi ca chỉ xếp trong giao các đợt của lớp tham gia."
+        )
     prefix_tot: Dict[str, int] = dict(prefix_student_totals or {})
     if weekend_large_course_min_students > 0 and not prefix_tot:
         prefix_tot = build_prefix_student_totals(exams)
@@ -153,10 +162,19 @@ def schedule_greedy(
     def _is_year1_student(sid: str) -> bool:
         return is_year1_anchor_student(sid, student_cohort_codes, year1_anchor)
 
+    def _max_exams_per_day_for_student(sid: str) -> int:
+        """Xếp tay: ~99% SV chỉ 1 môn/ngày khi bật ôn — không nới 2 môn/ngày trong greedy."""
+        cap = int(max_exams_per_day or 0)
+        if cap <= 0:
+            return 0
+        if prep_day_per_credit <= 0 and min_prep_days <= 0:
+            return cap
+        return 1
+
     def _prep_weight_for_student(sid: str) -> float:
         wave = cohort_wave_index(student_cohort_codes.get(str(sid), ""), year1_anchor)
         if wave == 0:
-            return 3.0
+            return 4.5
         if wave < 1_000_000:
             return max(0.5, 2.5 - wave * 0.12)
         return 0.35
@@ -259,11 +277,10 @@ def schedule_greedy(
                 exam.exam_id, list(range(spd))
             )
             sessions = sorted({int(s) for s in sessions if 0 <= int(s) < spd})
-            if sessions:
+            plan_days = exam_allowed_day_indices(exam, window)
+            if sessions and plan_days:
                 slots = [
-                    d * spd + s
-                    for d in range(window.total_days)
-                    for s in sessions
+                    d * spd + s for d in sorted(plan_days) for s in sessions
                 ]
         return slots
 
@@ -289,10 +306,11 @@ def schedule_greedy(
         if not ignore_capacity:
             if slot_load_students[slot] + exam.size > total_capacity:
                 return False
-        # max_exams_per_day
+        # max_exams_per_day (khóa sau: thường chỉ 1 môn/ngày để giữ ngày ôn)
         if not ignore_per_day and max_exams_per_day > 0:
             for sid in exam.student_ids:
-                if day_exams_per_student[(sid, day)] >= max_exams_per_day:
+                lim = _max_exams_per_day_for_student(sid)
+                if lim > 0 and day_exams_per_student[(sid, day)] >= lim:
                     return False
         # Ôn cứng: mọi SV khi chưa nới; nới chỉ bỏ ôn khóa cũ, giữ cứng cho năm 1.
         # Năm 1 được thi cùng ngày; giữa hai ngày khác nhau cần đủ ngày ôn theo tín chỉ.
@@ -305,7 +323,8 @@ def schedule_greedy(
                     for oidx in oidx_list:
                         if oidx == idx:
                             continue
-                        req_gap = prep_hard_gap_days_for_pair(
+                        if prep_gap_violated(
+                            abs(d - day),
                             exam,
                             exams[oidx],
                             prep_day_per_credit,
@@ -313,8 +332,7 @@ def schedule_greedy(
                             year1_allow_same_day=year1_allow_same_day,
                             for_year1_student=y1,
                             same_calendar_day=(d == day),
-                        )
-                        if req_gap > 0 and abs(d - day) + 1e-9 < req_gap:
+                        ):
                             return False
         # Giãn khỏi CN (mọi SV khi chưa nới; nới chỉ bỏ với khóa sau)
         if sunday_exam_days and weekday_at_day_index(window, day) != 6:
@@ -379,25 +397,28 @@ def schedule_greedy(
             ):
                 _commit(idx, int(slot))
                 return True
-        if not _exam_has_year1(idx):
-            _force_commit(idx, int(slot))
-            return True
-        # Cực chót: vẫn xếp (ưu tiên cùng ngày / ít vi phạm nhất) — 100% môn bắt buộc
+        day, _ = _slot_to_day_session(int(slot), window.sessions_per_day)
+        plan_days = exam_allowed_day_indices(exams[idx], window)
+        if plan_days and day not in plan_days:
+            return False
         if _try_place(
             idx,
             int(slot),
-            allow_conflict=True,
+            allow_conflict=False,
             ignore_capacity=True,
-            ignore_per_day=True,
-            ignore_credit_prep=True,
+            ignore_per_day=False,
+            ignore_credit_prep=False,
             ignore_khoa_nhom=ignore_khoa,
             ignore_prefix_anchor=ignore_prefix,
             ignore_sunday_spread=True,
         ):
             _commit(idx, int(slot))
             return True
-        _force_commit(idx, int(slot))
-        return True
+        if plan_days and day in plan_days:
+            if not _exam_has_year1(idx):
+                _force_commit(idx, int(slot))
+                return True
+        return False
 
     def _commit(idx: int, slot: int) -> None:
         exam = exams[idx]
@@ -474,20 +495,24 @@ def schedule_greedy(
                 allowed = _slots_for_exam(idx, relax_weekday=True)
                 best_slot = old_slot
                 best_pen = old_pen
-                for slot in allowed:
-                    if not _try_place(
-                        idx,
-                        slot,
-                        allow_conflict=False,
-                        ignore_capacity=True,
-                        ignore_per_day=True,
-                        ignore_credit_prep=False,
-                    ):
-                        continue
-                    pen = _score_slot(idx, slot)
-                    if pen < best_pen - 1e-6:
-                        best_pen = pen
-                        best_slot = slot
+                for ign_khoa in (False, True):
+                    for slot in allowed:
+                        if not _try_place(
+                            idx,
+                            slot,
+                            allow_conflict=False,
+                            ignore_capacity=True,
+                            ignore_per_day=False,
+                            ignore_credit_prep=False,
+                            ignore_khoa_nhom=ign_khoa,
+                        ):
+                            continue
+                        pen = _score_slot(idx, slot)
+                        if pen < best_pen - 1e-6:
+                            best_pen = pen
+                            best_slot = slot
+                    if best_slot != old_slot:
+                        break
                 if best_slot != old_slot:
                     _commit(idx, best_slot)
                     moved += 1
@@ -511,17 +536,21 @@ def schedule_greedy(
         if exam.priority > 0:
             score += (window.total_days - 1 - day) * exam.priority * 0.5
 
-        # (2) Load-balance — đây là phần mạnh nhất:
-        # Phạt theo TỈ LỆ vượt mục tiêu (square để ép cân bằng).
+        # (2) Load-balance — phạt theo tỉ lệ vượt mục tiêu trong phạm vi đợt Khoa_lop*.
         projected_day = day_load_students[day] + exam.size
         projected_slot = slot_load_students[slot] + exam.size
-        day_ratio = projected_day / max(1.0, target_per_day)
+        allowed_days = exam_allowed_day_indices(exam, window)
+        eff_day_count = len(allowed_days) if allowed_days else window.total_days
+        local_target_day = total_student_demand / max(1, eff_day_count)
+        day_ratio = projected_day / max(1.0, local_target_day)
         slot_ratio = projected_slot / max(1.0, target_per_slot)
+        # Chỉ phạt ngày/ca quá tải — không phạt ngày còn trống (tránh dồn môn gây vi phạm ôn).
         balance_pen = 0.0
         if day_ratio > 1.0:
             balance_pen += (day_ratio - 1.0) ** 2 * 100.0
-        else:
-            balance_pen += (1.0 - day_ratio) * 1.0
+        elif eff_day_count > 1 and day_ratio < 0.82:
+            # Khuyến khích dùng ngày còn trống — giảm đỉnh tải (gần lịch xếp tay).
+            balance_pen += (0.82 - day_ratio) ** 2 * 30.0
         if slot_ratio > 1.0:
             balance_pen += (slot_ratio - 1.0) ** 2 * 50.0
 
@@ -542,7 +571,7 @@ def schedule_greedy(
             if year1_anchor <= 0 or exam_wave_idx >= 1_000_000:
                 prep_w = 0.75
             elif exam_wave_idx == 0:
-                prep_w = 1.0
+                prep_w = 2.5
             else:
                 prep_w = max(0.75, 1.0 - exam_wave_idx * 0.06)
             sample = exam.student_ids if len(exam.student_ids) <= 300 else exam.student_ids[::max(1, len(exam.student_ids) // 300)]
@@ -553,24 +582,32 @@ def schedule_greedy(
                         if oidx == idx:
                             continue
                         other = exams[oidx]
-                        req = prep_days_required_for_pair(
-                            exam, other, prep_day_per_credit, min_prep_days
-                        )
-                        if req <= 0:
-                            continue
                         diff = abs(d - day)
-                        if diff < req:
-                            deficit = req - diff
+                        need_idx = min_prep_index_gap_between(
+                            exam,
+                            other,
+                            prep_day_per_credit,
+                            min_prep_days,
+                            year1_allow_same_day=year1_allow_same_day,
+                            for_year1_student=_is_year1_student(sid),
+                            same_calendar_day=(diff == 0),
+                        )
+                        if need_idx <= 0:
+                            continue
+                        if diff < need_idx:
+                            deficit = need_idx - diff
                             deficit_sq_sum += deficit * deficit * sv_w
+                            if _is_year1_student(sid) and diff > 0:
+                                deficit_sq_sum += deficit * deficit * sv_w * 150.0
                             if max(exam.credits, other.credits) >= 4.0:
                                 high_credit_pen += deficit * deficit * 2.0 * sv_w
                             if diff == 0:
                                 same_day_count += sv_w
             scale = len(exam.student_ids) / max(1, len(sample))
             spread_w = max(0.01, float(spread_prep_factor))
-            score += deficit_sq_sum * scale * 0.20 * spread_w * prep_w
-            score += high_credit_pen * scale * 0.12 * spread_w * prep_w
-            score += same_day_count * scale * 2.0 * spread_w * prep_w
+            score += deficit_sq_sum * scale * 0.55 * spread_w * prep_w
+            score += high_credit_pen * scale * 0.38 * spread_w * prep_w
+            score += same_day_count * scale * 72.0 * spread_w * prep_w
 
         # (4) Giữ gần base_slots khi repair
         prev = base_slots.get(exam.exam_id)
@@ -600,6 +637,44 @@ def schedule_greedy(
 
         return score
 
+    def _prep_deficit_for_slot(idx: int, slot: int) -> float:
+        """Tổng thiếu hụt ngày ôn nếu đặt môn idx vào slot (không commit)."""
+        if prep_day_per_credit <= 0 and min_prep_days <= 0:
+            return 0.0
+        exam = exams[idx]
+        day = slot // window.sessions_per_day
+        deficit = 0.0
+        for sid in exam.student_ids:
+            y1 = _is_year1_student(sid)
+            for d, oidx_list in student_day_exams[sid].items():
+                for oidx in oidx_list:
+                    if oidx == idx:
+                        continue
+                    other = exams[oidx]
+                    same = d == day
+                    if prep_gap_violated(
+                        abs(d - day),
+                        exam,
+                        other,
+                        prep_day_per_credit,
+                        min_prep_days,
+                        year1_allow_same_day=year1_allow_same_day,
+                        for_year1_student=y1,
+                        same_calendar_day=same,
+                    ):
+                        need = min_prep_index_gap_between(
+                            exam,
+                            other,
+                            prep_day_per_credit,
+                            min_prep_days,
+                            year1_allow_same_day=year1_allow_same_day,
+                            for_year1_student=y1,
+                            same_calendar_day=same,
+                        )
+                        gap = 0 if same else abs(d - day)
+                        deficit += max(1.0, float(need - gap))
+        return deficit
+
     def _pick_force_slot(
         idx: int,
         allowed: List[int],
@@ -607,7 +682,7 @@ def schedule_greedy(
         ignore_khoa: bool,
         ignore_prefix: bool,
     ) -> Optional[int]:
-        """Chọn slot ép cuối: ưu tiên còn ôn/CN cứng, rồi mới nới; luôn minimize _score_slot."""
+        """Chọn slot ép cuối: luôn ưu tiên ôn + 1 môn/ngày; không bỏ ôn trừ khi không còn chỗ."""
         tiers: List[Tuple[bool, bool, bool]] = [
             (False, False, False),
             (False, True, False),
@@ -616,34 +691,39 @@ def schedule_greedy(
         ]
         if not ignore_prefix:
             tiers.append((True, True, True))
-        for ignore_prep, ignore_sunday, ignore_pfx in tiers:
+        for ignore_sunday, ignore_pfx, ign_khoa in tiers:
+            if ign_khoa and not ignore_khoa:
+                continue
             best_slot: Optional[int] = None
             best_pen = float("inf")
             for slot in allowed:
                 if not _try_place(
                     idx,
                     slot,
-                    allow_conflict=True,
+                    allow_conflict=False,
                     ignore_capacity=True,
-                    ignore_per_day=True,
-                    ignore_credit_prep=ignore_prep,
-                    ignore_khoa_nhom=ignore_khoa,
+                    ignore_per_day=False,
+                    ignore_credit_prep=False,
+                    ignore_khoa_nhom=ign_khoa,
                     ignore_prefix_anchor=ignore_pfx,
                     ignore_sunday_spread=ignore_sunday,
                 ):
                     continue
-                pen = _score_slot(idx, slot)
-                overlap = sum(
-                    1 for sid in exams[idx].student_ids if sid in slot_used_students[slot]
-                )
-                pen += overlap * 1000.0
+                pen = _score_slot(idx, slot) + _prep_deficit_for_slot(idx, slot) * 5000.0
                 if pen < best_pen:
                     best_pen = pen
                     best_slot = slot
             if best_slot is not None:
                 return best_slot
+        # Không còn slot khả thi cứng — chọn chỗ thiếu ôn ít nhất (vẫn không trùng ca / 2 môn-ngày).
         if allowed:
-            return min(allowed, key=lambda sl: _score_slot(idx, sl))
+            return min(
+                allowed,
+                key=lambda sl: (
+                    _prep_deficit_for_slot(idx, sl),
+                    _score_slot(idx, sl),
+                ),
+            )
         return None
 
     def _place_with_policy(
@@ -707,6 +787,94 @@ def schedule_greedy(
                 _commit(idx, best_slot)
         return still_unplaced
 
+    def _vio_score_from_state(asgn: Dict[str, int]) -> Tuple[int, int, Dict[str, float]]:
+        per_student: Dict[str, List[Tuple[int, str]]] = defaultdict(list)
+        spd = window.sessions_per_day
+        for eid, slot in asgn.items():
+            if eid not in exam_index:
+                continue
+            day = slot // spd
+            for sid in exams[exam_index[eid]].student_ids:
+                per_student[sid].append((day, eid))
+        per_exam_sev: Dict[str, float] = defaultdict(float)
+        total = same = 0
+        for sid, entries in per_student.items():
+            entries.sort()
+            y1 = _is_year1_student(sid)
+            for i in range(1, len(entries)):
+                d0, e0 = entries[i - 1]
+                d1, e1 = entries[i]
+                if d0 != d1:
+                    continue
+                need = min_prep_index_gap_between(
+                    exams[exam_index[e0]],
+                    exams[exam_index[e1]],
+                    prep_day_per_credit,
+                    min_prep_days,
+                    year1_allow_same_day=year1_allow_same_day,
+                    for_year1_student=y1,
+                    same_calendar_day=True,
+                )
+                if need > 0:
+                    same += 1
+                    per_exam_sev[e0] += 2.0
+                    per_exam_sev[e1] += 2.0
+                total += 1
+        return total, same, per_exam_sev
+
+    def _count_same_day_violation_pairs() -> int:
+        _, sd, _ = _vio_score_from_state(assignment)
+        return sd
+
+    def _break_same_day_pairs(max_passes: int = 10) -> int:
+        """Dời môn khỏi ngày đã có ≥2 môn — mọi SV khi chưa nới 2 môn/ngày (giống xếp tay)."""
+        moved = 0
+        fixed_set = set(fixed_slots.keys())
+        spd = window.sessions_per_day
+        for _ in range(max_passes):
+            round_m = 0
+            sid_exams: Dict[str, List[str]] = defaultdict(list)
+            for eid in assignment:
+                for sid in exams[exam_index[eid]].student_ids:
+                    sid_exams[sid].append(eid)
+            for sid, eids in sid_exams.items():
+                uniq = sorted(set(eids), key=lambda e: assignment[e] // spd)
+                by_day: Dict[int, List[str]] = defaultdict(list)
+                for e in uniq:
+                    by_day[assignment[e] // spd].append(e)
+                for day, day_eids in by_day.items():
+                    if len(day_eids) < 2:
+                        continue
+                    for eid in day_eids:
+                        if eid in fixed_set:
+                            continue
+                        midx = exam_index[eid]
+                        old = assignment[eid]
+                        if _uncommit(midx) is None:
+                            continue
+                        placed = False
+                        for cand in _slots_for_exam(midx, relax_weekday=True):
+                            if cand // spd == day:
+                                continue
+                            if _try_place(
+                                midx,
+                                cand,
+                                allow_conflict=False,
+                                ignore_capacity=True,
+                                ignore_per_day=False,
+                                ignore_credit_prep=False,
+                            ):
+                                _commit(midx, cand)
+                                placed = True
+                                round_m += 1
+                                break
+                        if not placed:
+                            _commit(midx, old)
+            moved += round_m
+            if round_m == 0:
+                break
+        return moved
+
     remaining_state = {"pending": remaining}
 
     # 1) Thử strict (gồm ôn theo max tín chỉ cặp môn)
@@ -729,16 +897,39 @@ def schedule_greedy(
         )
         remaining_state["pending"] = leftover
 
-    # 3) Nới max_exams_per_day
+    # 2b) Tách cặp thi cùng ngày (khóa sau) trước khi nới môn/ngày
+    if assignment and max_exams_per_day > 0 and (prep_day_per_credit > 0 or min_prep_days > 0):
+        sd_before = _count_same_day_violation_pairs()
+        if sd_before > 0:
+            broken = _break_same_day_pairs(max_passes=15)
+            if broken > 0:
+                relaxations.append(
+                    f"Tách thi cùng ngày (trước khi nới môn/ngày): {sd_before:,} → "
+                    f"{_count_same_day_violation_pairs():,} cặp cùng-ngày, đã dời {broken} môn."
+                )
+
+    # 3) Thử xếp tiếp — vẫn giữ 1 môn/SV/ngày (giống xếp tay)
     if leftover:
-        relaxations.append("Cho phép vượt giới hạn môn/SV/ngày để đảm bảo có lịch.")
+        relaxations.append(
+            "Tiếp tục xếp môn còn lại — giữ tối đa 1 môn/SV/ngày để bảo toàn ngày ôn."
+        )
         leftover = _place_with_policy(
             allow_conflict=False,
             ignore_capacity=True,
-            ignore_per_day=True,
+            ignore_per_day=False,
             ignore_credit_prep=False,
         )
         remaining_state["pending"] = leftover
+
+    if assignment and (prep_day_per_credit > 0 or min_prep_days > 0):
+        sd2 = _count_same_day_violation_pairs()
+        if sd2 > 0:
+            b2 = _break_same_day_pairs(max_passes=20)
+            if b2 > 0:
+                relaxations.append(
+                    f"Tách thi cùng ngày (sau bước 3): {_count_same_day_violation_pairs():,} cặp, "
+                    f"đã dời thêm {b2} môn."
+                )
 
     def _place_leftover_loop(
         indices: List[int],
@@ -748,6 +939,7 @@ def schedule_greedy(
         ignore_khoa: bool,
         ignore_prefix: bool,
         ignore_sunday: bool = False,
+        ignore_per_day: bool = False,
         force_if_needed: bool,
     ) -> List[int]:
         still: List[int] = []
@@ -764,13 +956,13 @@ def schedule_greedy(
                     slot,
                     allow_conflict=allow_conflict,
                     ignore_capacity=True,
-                    ignore_per_day=True,
+                    ignore_per_day=ignore_per_day,
                     ignore_credit_prep=ignore_credit_prep,
                     ignore_khoa_nhom=ignore_khoa,
                     ignore_prefix_anchor=ignore_prefix,
                     ignore_sunday_spread=ignore_sunday,
                 ):
-                    pen = _score_slot(idx, slot)
+                    pen = _score_slot(idx, slot) + _prep_deficit_for_slot(idx, slot) * 8000.0
                     if allow_conflict:
                         overlap = sum(
                             1
@@ -787,12 +979,32 @@ def schedule_greedy(
                 forced = _pick_force_slot(
                     idx, allowed, ignore_khoa=ignore_khoa, ignore_prefix=ignore_prefix
                 )
-                if forced is not None:
-                    _safe_force_place(
-                        idx, forced, ignore_khoa=ignore_khoa, ignore_prefix=ignore_prefix
+                slot_force = int(forced) if forced is not None else int(
+                    min(
+                        allowed,
+                        key=lambda sl: (
+                            _prep_deficit_for_slot(idx, sl),
+                            _score_slot(idx, sl),
+                        ),
                     )
-                else:
-                    still.append(idx)
+                )
+                if not _safe_force_place(
+                    idx, slot_force, ignore_khoa=ignore_khoa, ignore_prefix=ignore_prefix
+                ):
+                    if not _try_place(
+                        idx,
+                        slot_force,
+                        allow_conflict=False,
+                        ignore_capacity=True,
+                        ignore_per_day=False,
+                        ignore_credit_prep=False,
+                        ignore_khoa_nhom=ignore_khoa,
+                        ignore_prefix_anchor=ignore_prefix,
+                        ignore_sunday_spread=True,
+                    ):
+                        _force_commit(idx, slot_force)
+                    else:
+                        _commit(idx, slot_force)
             else:
                 still.append(idx)
         return still
@@ -811,93 +1023,264 @@ def schedule_greedy(
             ignore_khoa=True,
             ignore_prefix=False,
             ignore_sunday=False,
+            ignore_per_day=False,
             force_if_needed=False,
         )
         leftover = [i for i in leftover if exams[i].exam_id not in assignment]
 
-    # 4) Trùng SV cùng ca — ôn chỉ khóa anchor; giữ Khoa_nhom
+    # 4) Bỏ «trùng SV cùng ca» — gây hàng nghìn vi phạm ôn (SV thi 2 môn cùng slot).
+    # Thay bằng tiếp tục xếp với Khoa_nhom, vẫn 1 môn/SV/ngày + ôn cứng.
     if leftover:
         relaxations.append(
-            "Cho phép trùng SV cùng ca — ôn cứng chỉ SV khóa năm 1; vẫn giữ Khoa_nhom."
+            f"Tiếp tục xếp {len(leftover)} môn — giữ 1 môn/SV/ngày, không trùng ca."
         )
         leftover = _place_leftover_loop(
             list(leftover),
-            allow_conflict=True,
+            allow_conflict=False,
             ignore_credit_prep=False,
             ignore_khoa=False,
             ignore_prefix=False,
             ignore_sunday=False,
+            ignore_per_day=False,
             force_if_needed=False,
         )
 
-    # 5) Nới Khoa_nhom + buổi HP (ca tách) — ôn chỉ khóa anchor
+    # 4.5) Nới loại ca — thiếu ô theo nhãn LT/TN/VD (vẫn giữ Khoa_nhom & buổi HP)
+    if leftover:
+        relaxations.append(
+            f"Nới loại ca cho {len(leftover)} môn — dùng mọi ca trong đợt nếu thiếu slot theo nhãn loại."
+        )
+        spd_sess = window.sessions_per_day
+        for idx in leftover:
+            allowed_sessions_by_exam_id[exams[idx].exam_id] = list(range(spd_sess))
+        leftover = _place_leftover_loop(
+            list(leftover),
+            allow_conflict=False,
+            ignore_credit_prep=False,
+            ignore_khoa=False,
+            ignore_prefix=False,
+            ignore_sunday=False,
+            ignore_per_day=False,
+            force_if_needed=False,
+        )
+
+    # 5) Nới Khoa_nhom + buổi HP (ca tách) — vẫn giữ ôn + 1 môn/ngày
     if leftover:
         relaxations.append(
             f"Nới Khoa_nhom & buổi HP cho {len(leftover)} môn — khóa sau có thể vi phạm ôn khi cần."
         )
         leftover = _place_leftover_loop(
             list(leftover),
-            allow_conflict=True,
+            allow_conflict=False,
             ignore_credit_prep=False,
             ignore_khoa=True,
             ignore_prefix=True,
             ignore_sunday=False,
+            ignore_per_day=False,
             force_if_needed=False,
         )
 
-    # 5b) Nới ôn cho khóa cũ — SV năm 1 vẫn giữ ngày ôn (cùng ngày được)
-    if leftover:
-        relaxations.append(
-            f"Nới ngày ôn cho khóa sau ({len(leftover)} môn) — SV khóa {year1_anchor:02d} vẫn giữ ôn."
-        )
-        leftover = _place_leftover_loop(
-            list(leftover),
-            allow_conflict=True,
-            ignore_credit_prep=True,
-            ignore_khoa=True,
-            ignore_prefix=True,
-            ignore_sunday=False,
-            force_if_needed=False,
-        )
-
-    # 6) Bắt buộc 100% — nới giãn CN; vẫn giữ ôn khóa anchor (cùng ngày được)
+    # 6) Bắt buộc 100% — chỉ nới CN / trùng ca khi ép; vẫn ưu tiên ôn + 1 môn/ngày
     if leftover:
         n_force = len(leftover)
         relaxations.append(
-            f"Đặt bắt buộc {n_force} môn còn lại — ưu tiên slot khả thi cho SV khóa {year1_anchor:02d}."
+            f"Đặt bắt buộc {n_force} môn còn lại — ưu tiên slot còn đủ ngày ôn."
         )
         weekday_relax_logged = True
         leftover = _place_leftover_loop(
             list(leftover),
-            allow_conflict=True,
+            allow_conflict=False,
             ignore_credit_prep=False,
             ignore_khoa=True,
             ignore_prefix=True,
             ignore_sunday=True,
+            ignore_per_day=False,
             force_if_needed=True,
         )
 
-    # 7) Hiếm: không có ô ca hợp lệ (thiếu cấu hình ca) — gán slot 0
+    # 7) Không ép ra ngoài Ke_hoach_thi — chỉ gán trong ô còn lại của đợt lớp
     if leftover:
-        relaxations.append(
-            f"Gán khẩn cấp {len(leftover)} môn vào slot mặc định (kiểm tra cấu hình ca thi / kế hoạch ngày)."
-        )
+        plan_blocked: List[int] = []
         for idx in leftover:
             eid = exams[idx].exam_id
             allowed_em = _slots_for_exam(idx, relax_weekday=True)
+            if not allowed_em:
+                plan_days = exam_allowed_day_indices(exams[idx], window)
+                if plan_days:
+                    spd = window.sessions_per_day
+                    sessions = allowed_sessions_by_exam_id.get(
+                        eid, list(range(spd))
+                    )
+                    sessions = sorted({int(s) for s in sessions if 0 <= int(s) < spd})
+                    allowed_em = [
+                        d * spd + s for d in sorted(plan_days) for s in sessions
+                    ]
             if allowed_em:
                 forced = _pick_force_slot(
                     idx, allowed_em, ignore_khoa=True, ignore_prefix=True
                 )
                 slot_guess = int(forced) if forced is not None else int(allowed_em[0])
+                if not _safe_force_place(
+                    idx, slot_guess, ignore_khoa=True, ignore_prefix=True
+                ):
+                    best_em = min(
+                        allowed_em,
+                        key=lambda sl: (
+                            _prep_deficit_for_slot(idx, sl),
+                            _score_slot(idx, sl),
+                        ),
+                    )
+                    placed_em = False
+                    for try_slot in (slot_guess, best_em):
+                        if _try_place(
+                            idx,
+                            int(try_slot),
+                            allow_conflict=False,
+                            ignore_capacity=True,
+                            ignore_per_day=False,
+                            ignore_credit_prep=False,
+                            ignore_khoa_nhom=True,
+                            ignore_prefix_anchor=True,
+                            ignore_sunday_spread=True,
+                        ):
+                            _commit(idx, int(try_slot))
+                            placed_em = True
+                            break
+                    if not placed_em:
+                        _force_commit(idx, int(best_em))
             else:
-                slot_guess = int(fixed_slots[eid]) if eid in fixed_slots else 0
-            _safe_force_place(idx, slot_guess, ignore_khoa=True, ignore_prefix=True)
+                plan_blocked.append(idx)
+        if plan_blocked:
+            relaxations.append(
+                f"Không xếp được {len(plan_blocked)} môn trong đợt Khoa_lop* "
+                "(gom lớp khác đợt hoặc thiếu ngày — xem «Môn chưa xếp»)."
+            )
 
-    repaired = _greedy_repair_prep(rounds=4) + _greedy_repair_prep(rounds=4, year1_only=True)
+    repaired = _greedy_repair_prep(rounds=5) + _greedy_repair_prep(rounds=10, year1_only=True)
+
+    def _repair_prep_gaps(
+        max_rounds: int = 24,
+        *,
+        year1_only: bool = False,
+        max_wave: Optional[int] = None,
+    ) -> int:
+        """Giãn lịch SV: dời môn khi hai ngày thi liên tiếp thiếu ôn (ưu tiên khóa anchor)."""
+        if year1_anchor <= 0 and year1_only:
+            return 0
+        fixed_set = set(fixed_slots.keys())
+        spd = window.sessions_per_day
+        moved = 0
+        for _ in range(max_rounds):
+            round_moved = 0
+            sid_to_eids: Dict[str, List[str]] = defaultdict(list)
+            for idx in range(n):
+                eid = exams[idx].exam_id
+                if eid not in assignment:
+                    continue
+                for sid in exams[idx].student_ids:
+                    if year1_only and not _is_year1_student(sid):
+                        continue
+                    if max_wave is not None:
+                        w = cohort_wave_index(
+                            student_cohort_codes.get(str(sid), ""), year1_anchor
+                        )
+                        if w > max_wave:
+                            continue
+                    sid_to_eids[sid].append(eid)
+            for sid, eids in sid_to_eids.items():
+                y1 = _is_year1_student(sid)
+                uniq = sorted(set(eids), key=lambda e: assignment[e] // spd)
+                for i in range(1, len(uniq)):
+                    prev_eid, curr_eid = uniq[i - 1], uniq[i]
+                    prev_day = assignment[prev_eid] // spd
+                    curr_day = assignment[curr_eid] // spd
+                    same_cal = prev_day == curr_day
+                    need = min_prep_index_gap_between(
+                        exams[exam_index[prev_eid]],
+                        exams[exam_index[curr_eid]],
+                        prep_day_per_credit,
+                        min_prep_days,
+                        year1_allow_same_day=year1_allow_same_day,
+                        for_year1_student=y1,
+                        same_calendar_day=same_cal,
+                    )
+                    gap = 0 if same_cal else (curr_day - prev_day)
+                    if need <= 0 or gap >= need:
+                        continue
+                    fixed = False
+                    for move_eid, anchor_day, later in (
+                        (curr_eid, prev_day, True),
+                        (prev_eid, curr_day, False),
+                    ):
+                        if move_eid in fixed_set:
+                            continue
+                        midx = exam_index[move_eid]
+                        old_slot = assignment[move_eid]
+                        if _uncommit(midx) is None:
+                            continue
+                        placed = False
+                        best_cand = old_slot
+                        best_pen = float("inf")
+                        for ign_khoa in (False, True):
+                            for cand in _slots_for_exam(midx, relax_weekday=True):
+                                new_day = cand // spd
+                                if same_cal:
+                                    if new_day == anchor_day:
+                                        continue
+                                elif later:
+                                    if new_day <= anchor_day or (new_day - anchor_day) < need:
+                                        continue
+                                elif new_day >= anchor_day or (anchor_day - new_day) < need:
+                                    continue
+                                if not _try_place(
+                                    midx,
+                                    cand,
+                                    allow_conflict=False,
+                                    ignore_capacity=True,
+                                    ignore_per_day=False,
+                                    ignore_credit_prep=False,
+                                    ignore_khoa_nhom=ign_khoa,
+                                ):
+                                    continue
+                                _commit(midx, cand)
+                                pen = _score_slot(midx, cand)
+                                if pen < best_pen - 1e-6:
+                                    best_pen = pen
+                                    best_cand = cand
+                                if _uncommit(midx) is None:
+                                    break
+                            if best_cand != old_slot:
+                                break
+                        if best_cand != old_slot:
+                            _commit(midx, best_cand)
+                            placed = True
+                            round_moved += 1
+                            fixed = True
+                            break
+                        _commit(midx, old_slot)
+                    if fixed:
+                        break
+            moved += round_moved
+            if round_moved == 0:
+                break
+        return moved
+
+    # Cuối pipeline: sửa ôn mọi khóa (ưu tiên anchor trước).
+    y1_fixed = _repair_prep_gaps(max_rounds=28, year1_only=True)
+    all_fixed = _repair_prep_gaps(max_rounds=32, year1_only=False, max_wave=None)
+    repaired += y1_fixed + all_fixed
+    repaired += _greedy_repair_prep(rounds=10)
+    sd_tail = _count_same_day_violation_pairs()
+    if sd_tail > 0:
+        broken_tail = _break_same_day_pairs(max_passes=12)
+        repaired += broken_tail
+        if broken_tail > 0:
+            repaired += _repair_prep_gaps(max_rounds=12, year1_only=False, max_wave=None)
+            repaired += _greedy_repair_prep(rounds=4)
     if repaired > 0:
         relaxations.append(
-            f"Sửa sau greedy: đã chuyển {repaired} ca để giảm vi phạm ôn/CN (giữ cùng buổi HP)."
+            f"Sửa sau greedy: đã chuyển {repaired} ca để giảm vi phạm ôn/CN "
+            f"(khóa {year1_anchor:02d}: {y1_fixed}, mọi khóa: {all_fixed})."
         )
 
     unplaced = [e.exam_id for e in exams if e.exam_id not in assignment]
@@ -962,6 +1345,9 @@ def lns_improve(
     if not assignment or pool_size <= 0:
         return assignment, []
 
+    # Phạt cặp thi cùng ngày (gap=0) — cao hơn cặp thiếu 1 ngày để LNS ưu tiên tách cùng-ngày.
+    _LNS_SAME_DAY_SEV_BONUS = 4.0
+
     logs: List[str] = []
     fixed_slots = fixed_slots or {}
     exam_index = {e.exam_id: i for i, e in enumerate(exams)}
@@ -985,6 +1371,15 @@ def lns_improve(
     def _lns_is_year1(sid: str) -> bool:
         return is_year1_anchor_student(sid, student_cohort_codes, lns_year1_anchor)
 
+    def _lns_max_exams_per_day(sid: str) -> int:
+        cap = int(max_exams_per_day or 0)
+        if cap <= 0:
+            return 0
+        if prep_day_per_credit <= 0 and min_prep_days <= 0:
+            return cap
+        # LNS không nới 2 môn/ngày — giữ như xếp tay, tránh làm xấu vi phạm ôn.
+        return 1
+
     keys_by_eid = {e.exam_id: exam_khoa_nhom_keys(e) for e in exams}
 
     def _compute_violation_score(asgn: Dict[str, int]) -> Tuple[int, int, Dict[str, float]]:
@@ -1007,7 +1402,7 @@ def lns_improve(
                 per_student[sid].append((day, eid))
         per_exam_sev: Dict[str, float] = defaultdict(float)
         total = 0
-        same_day = 0
+        same_day_count = 0
         for sid, entries in per_student.items():
             entries.sort()
             for i in range(1, len(entries)):
@@ -1015,23 +1410,30 @@ def lns_improve(
                 curr_day, curr_eid = entries[i]
                 prev_exam = exams[exam_index[prev_eid]]
                 curr_exam = exams[exam_index[curr_eid]]
-                req = prep_days_required_for_pair(
+                y1 = _lns_is_year1(sid)
+                is_same_calendar = curr_day == prev_day
+                need = min_prep_index_gap_between(
                     prev_exam,
                     curr_exam,
                     prep_day_per_credit,
                     min_prep_days,
+                    year1_allow_same_day=year1_allow_same_day,
+                    for_year1_student=y1,
+                    same_calendar_day=is_same_calendar,
                 )
                 gap = curr_day - prev_day
-                if gap + 1e-9 < req:
+                if need <= 0:
+                    continue
+                if gap < need:
                     total += 1
-                    deficit = req - gap
+                    deficit = need - gap
                     sev = 1.0 + 0.3 * deficit
                     if gap == 0:
-                        same_day += 1
-                        sev += 2.0
+                        same_day_count += 1
+                        sev += _LNS_SAME_DAY_SEV_BONUS
                     per_exam_sev[curr_eid] += sev
                     per_exam_sev[prev_eid] += sev
-        return total, same_day, per_exam_sev
+        return total, same_day_count, per_exam_sev
 
     base_vio, base_same_day, _ = _compute_violation_score(current)
     logs.append(
@@ -1093,7 +1495,7 @@ def lns_improve(
         `_compute_violation_score` để giữ nhất quán. Threshold dùng req của môn sau, đúng
         ý nghĩa "môn sau cần ngày ôn trước nó".
 
-        Điểm = 1.0 (base count) + 0.3·deficit + 2.0·1[gap==0]. Dùng cho LNS so sánh delta
+        Điểm = 1.0 (base count) + 0.3·deficit + bonus·1[gap==0]. Dùng cho LNS so sánh delta
         khi di chuyển; vì cả 2 nhánh (X là môn trước / X là môn sau) đều được xét, LNS sẽ
         nhận ra cơ hội dịch chuyển X kể cả khi X là môn trước trong cặp vi phạm.
         """
@@ -1121,7 +1523,7 @@ def lns_improve(
                     deficit = threshold - gap
                     sev += 1.0 + 0.3 * deficit
                     if gap == 0:
-                        sev += 2.0
+                        sev += _LNS_SAME_DAY_SEV_BONUS
         # Phạt giãn khỏi môn thi Chủ nhật (SV trùng) — khớp greedy Sunday-spread
         if weekday_at_day_index(window, day_x) != 6:
             for sid in exam_x.student_ids:
@@ -1158,7 +1560,8 @@ def lns_improve(
         if old_day == new_day:
             return False
         for sid in exam.student_ids:
-            if student_day_count[(sid, new_day)] >= max_exams_per_day:
+            lim = _lns_max_exams_per_day(sid)
+            if lim > 0 and student_day_count[(sid, new_day)] >= lim:
                 return True
         return False
 
@@ -1178,7 +1581,8 @@ def lns_improve(
                     continue
                 other_day = other_slot // sessions_per_day
                 other_exam = exams[exam_index[other_eid]]
-                req_gap = prep_hard_gap_days_for_pair(
+                if prep_gap_violated(
+                    abs(new_day - other_day),
                     exam,
                     other_exam,
                     prep_day_per_credit,
@@ -1186,8 +1590,7 @@ def lns_improve(
                     year1_allow_same_day=year1_allow_same_day,
                     for_year1_student=y1,
                     same_calendar_day=(new_day == other_day),
-                )
-                if req_gap > 0 and abs(new_day - other_day) + 1e-9 < req_gap:
+                ):
                     return False
         return True
 
@@ -1234,8 +1637,11 @@ def lns_improve(
             return 0.0
         return (projected - soft_slot_cap) * PEAK_WEIGHT
 
-    # Pre-compute allowed slots per exam (thứ trong tuần: T2–T7 / T7–CN cho môn đông)
+    # Pre-compute allowed slots per exam (thứ trong tuần: T2–T7 / T7–CN cho môn đông).
+    # LNS cũng thử mọi loại ca trong đợt để tìm chỗ giảm vi phạm ôn (không chỉ ca theo nhãn).
     allowed_by_exam: Dict[str, List[int]] = {}
+    spd_lns = window.sessions_per_day
+    all_session_slots = list(range(spd_lns))
     for eid in current.keys():
         if eid not in exam_index:
             continue
@@ -1259,6 +1665,17 @@ def lns_improve(
                 prefix_totals=prefix_tot,
                 relax_weekday_rule=True,
             )
+        wide = enumerate_feasible_slots_for_exam(
+            ex,
+            window,
+            {eid: all_session_slots},
+            fixed_slots,
+            weekend_large_min_students=weekend_large_course_min_students,
+            prefix_totals=prefix_tot,
+            relax_weekday_rule=True,
+        )
+        if wide:
+            slots = sorted(set(slots) | set(wide))
         allowed_by_exam[eid] = slots
 
     # Slot load tracking (SV per slot) — để LNS biết peak nào đang đông
@@ -1298,7 +1715,7 @@ def lns_improve(
                     sev += 1.0 + 0.3 * deficit
                     if gap == 0:
                         sd_count += 1
-                        sev += 2.0
+                        sev += _LNS_SAME_DAY_SEV_BONUS
         return sd_count, sev
 
     def _collect_same_day_exam_ids() -> List[str]:
@@ -1333,6 +1750,13 @@ def lns_improve(
                     result.append(e_curr)
         return result
 
+    if base_vio > 8000:
+        lns_no_improve_limit = 4
+    elif base_vio > 4000:
+        lns_no_improve_limit = 3
+    else:
+        lns_no_improve_limit = 2
+
     no_improve_count = 0
     for it in range(iterations):
         if progress_cb:
@@ -1360,10 +1784,11 @@ def lns_improve(
             old_slot = current[eid]
             cur_vio = _vio_for_exam(eid, old_slot)
             cur_peak = _peak_cost(eid, old_slot)
-            if cur_vio <= 0 and cur_peak <= 0:
+            cur_sd, _ = _same_day_and_sev_for_exam(eid, old_slot)
+            if cur_vio <= 0 and cur_peak <= 0 and cur_sd <= 0:
                 continue
             best_slot = old_slot
-            best_score = cur_vio + cur_peak
+            best_pair = (cur_sd, cur_vio + cur_peak)
             for slot in allowed_by_exam[eid]:
                 if slot == old_slot:
                     continue
@@ -1379,9 +1804,10 @@ def lns_improve(
                     continue
                 v = _vio_for_exam(eid, slot)
                 p = _peak_cost(eid, slot)
-                s = v + p
-                if s < best_score - 1e-9:
-                    best_score = s
+                new_sd, _ = _same_day_and_sev_for_exam(eid, slot)
+                pair = (new_sd, v + p)
+                if pair < best_pair:
+                    best_pair = pair
                     best_slot = slot
             if best_slot != old_slot:
                 _move(eid, best_slot)
@@ -1401,8 +1827,10 @@ def lns_improve(
                 f"— không cải thiện, đã thử chuyển {moved} môn."
             )
             no_improve_count += 1
-            if no_improve_count >= 2:
-                logs.append("Dừng cải tiến LNS chính sớm: hai vòng liên tiếp không cải thiện.")
+            if no_improve_count >= lns_no_improve_limit:
+                logs.append(
+                    f"Dừng cải tiến LNS chính sớm: {lns_no_improve_limit} vòng liên tiếp không cải thiện."
+                )
                 break
 
     # ---- Pass cuối: dedicated same-day breaker ----
@@ -1411,11 +1839,13 @@ def lns_improve(
     # cụ thể — đó là cấu trúc thuật toán: tách giai đoạn tổng quát (LNS chính) và giai đoạn
     # targeted (same-day) để tránh stuck ở local optimum nhẹ.
     _, same_day_left, _ = _compute_violation_score(current)
-    if same_day_left > 0:
+    for sd_pass in range(3):
+        if same_day_left <= 0:
+            break
         if progress_cb:
             progress_cb(
                 72,
-                f"Bước 2/3: pass cuối — đang phá {same_day_left:,} cặp cùng-ngày…",
+                f"Bước 2/3: pass cùng-ngày {sd_pass + 1}/3 — đang phá {same_day_left:,} cặp…",
             )
         same_day_targets = _collect_same_day_exam_ids()
         same_day_targets = [eid for eid in same_day_targets if eid not in fixed_slots]
@@ -1444,7 +1874,6 @@ def lns_improve(
                 new_sd, new_sev = _same_day_and_sev_for_exam(eid, slot)
                 new_peak = _peak_cost(eid, slot)
                 pair = (new_sd, new_sev + new_peak)
-                # Ưu tiên giảm same_day trước, rồi mới đến severity tổng.
                 if pair < best_pair:
                     best_pair = pair
                     best_slot = slot
@@ -1453,14 +1882,34 @@ def lns_improve(
                 moved_sd += 1
         after_total, after_sd, _ = _compute_violation_score(current)
         logs.append(
-            f"Pass cuối (same-day): cùng-ngày {same_day_left:,} → {after_sd:,} "
-            f"(tổng vi phạm hiện {after_total:,}, đã chuyển {moved_sd} môn)"
+            f"Pass cùng-ngày {sd_pass + 1}: {same_day_left:,} → {after_sd:,} "
+            f"(tổng {after_total:,}, đã chuyển {moved_sd} môn)"
         )
+        if after_sd >= same_day_left:
+            break
+        same_day_left = after_sd
 
     # ---- Pass sửa prep (nhanh): dùng điểm cục bộ / môn — không quét lại toàn bộ SV mỗi ô thử ----
-    prep_rounds = max(3, min(8, iterations * 2))
-    prep_pool = min(pool_size, 80 if base_vio > 2500 else pool_size)
-    prep_slot_cap = 40
+    if base_vio > 8000:
+        prep_rounds = max(14, min(22, iterations * 3))
+        prep_pool = min(max(pool_size, 300), 400)
+        prep_slot_cap = 120
+    elif base_vio > 4000:
+        prep_rounds = max(12, min(20, iterations * 2 + 6))
+        prep_pool = min(max(pool_size, 260), 360)
+        prep_slot_cap = 110
+    elif base_vio > 2500:
+        prep_rounds = max(14, min(22, iterations * 2 + 8))
+        prep_pool = min(max(pool_size, 300), 400)
+        prep_slot_cap = 120
+    elif base_vio > 1200:
+        prep_rounds = max(10, min(18, iterations * 2 + 6))
+        prep_pool = min(max(pool_size, 240), 320)
+        prep_slot_cap = 100
+    else:
+        prep_rounds = max(6, min(12, iterations * 2 + 2))
+        prep_pool = min(pool_size, 120)
+        prep_slot_cap = 60
     for pr in range(prep_rounds):
         total_vio, same_day_vio, per_exam_sev = _compute_violation_score(current)
         if total_vio == 0:
@@ -1523,6 +1972,47 @@ def lns_improve(
             )
             break
 
+    # Pass sửa prep mạnh: nới Khoa_nhom/buổi HP khi còn nhiều vi phạm (sau bước nới ôn khóa sau).
+    total_after_prep, sd_after_prep, per_exam_after = _compute_violation_score(current)
+    if total_after_prep > 3500:
+        relax_pool = sorted(
+            ((eid, v) for eid, v in per_exam_after.items() if eid not in fixed_slots),
+            key=lambda x: -x[1],
+        )[: min(350, prep_pool + 80)]
+        moved_relax = 0
+        for eid, _ in relax_pool:
+            old_slot = current[eid]
+            cur_sd, cur_sev = _same_day_and_sev_for_exam(eid, old_slot)
+            cur_score = _vio_for_exam(eid, old_slot) + cur_sev + _peak_cost(eid, old_slot)
+            if cur_score <= 0 and cur_sd <= 0:
+                continue
+            best_slot = old_slot
+            best_pair = (cur_sd, cur_score)
+            for slot in allowed_by_exam.get(eid, []):
+                if slot == old_slot:
+                    continue
+                if _conflict_at_slot(eid, slot):
+                    continue
+                if _violates_max_per_day(eid, slot):
+                    continue
+                if not _prep_feasible(eid, slot):
+                    continue
+                new_sd, new_sev = _same_day_and_sev_for_exam(eid, slot)
+                new_s = _vio_for_exam(eid, slot) + new_sev + _peak_cost(eid, slot)
+                pair = (new_sd, new_s)
+                if pair < best_pair:
+                    best_pair = pair
+                    best_slot = slot
+            if best_slot != old_slot:
+                _move(eid, best_slot)
+                moved_relax += 1
+        after_relax, after_relax_sd, _ = _compute_violation_score(current)
+        if moved_relax > 0:
+            logs.append(
+                f"Pass sửa prep (nới Khoa_nhom/buổi): {total_after_prep:,} → {after_relax:,} "
+                f"(cùng-ngày {sd_after_prep:,} → {after_relax_sd:,}, đã chuyển {moved_relax} môn)"
+            )
+
     # Pass nhẹ: phá cặp cùng-ngày có SV khóa anchor (nguyên nhân actual=0).
     if lns_year1_anchor > 0:
         y1_sd_targets = [
@@ -1566,6 +2056,484 @@ def lns_improve(
                 f"Pass khóa {lns_year1_anchor:02d} (cùng-ngày): đã chuyển {moved_y1_sd} môn "
                 f"liên quan SV năm 1."
             )
+
+        moved_y1_gap = 0
+        for _gap_round in range(10):
+            gap_round_moves = 0
+            for sid in list(student_to_exams.keys()):
+                if not _lns_is_year1(sid):
+                    continue
+                eids = [e for e in student_to_exams[sid] if e in current and e not in fixed_slots]
+                entries = sorted(
+                    [(current[e], e) for e in eids],
+                    key=lambda x: x[0] // sessions_per_day,
+                )
+                for i in range(1, len(entries)):
+                    prev_slot, prev_eid = entries[i - 1]
+                    curr_slot, curr_eid = entries[i]
+                    prev_day = prev_slot // sessions_per_day
+                    curr_day = curr_slot // sessions_per_day
+                    if prev_day == curr_day:
+                        continue
+                    need = min_prep_index_gap_between(
+                        exams[exam_index[prev_eid]],
+                        exams[exam_index[curr_eid]],
+                        prep_day_per_credit,
+                        min_prep_days,
+                        year1_allow_same_day=year1_allow_same_day,
+                        for_year1_student=True,
+                        same_calendar_day=False,
+                    )
+                    if need <= 0 or (curr_day - prev_day) >= need:
+                        continue
+                    for move_eid, other_eid, move_later in (
+                        (curr_eid, prev_eid, True),
+                        (prev_eid, curr_eid, False),
+                    ):
+                        if move_eid in fixed_slots:
+                            continue
+                        old_slot = current[move_eid]
+                        anchor_day = curr_day if move_later else prev_day
+                        best_slot = old_slot
+                        best_key = (1, float("inf"))
+                        for slot in allowed_by_exam.get(move_eid, []):
+                            new_day = slot // sessions_per_day
+                            if move_later:
+                                if new_day <= anchor_day:
+                                    continue
+                                if (new_day - anchor_day) < need:
+                                    continue
+                            else:
+                                if new_day >= anchor_day:
+                                    continue
+                                if (anchor_day - new_day) < need:
+                                    continue
+                            if _conflict_at_slot(move_eid, slot):
+                                continue
+                            if _violates_max_per_day(move_eid, slot):
+                                continue
+                            if not _khoa_feasible(move_eid, slot):
+                                continue
+                            if not _prefix_feasible(move_eid, slot):
+                                continue
+                            if not _prep_feasible(move_eid, slot):
+                                continue
+                            sd, sev = _same_day_and_sev_for_exam(move_eid, slot)
+                            key = (sd, _vio_for_exam(move_eid, slot) + sev + _peak_cost(move_eid, slot))
+                            if key < best_key:
+                                best_key = key
+                                best_slot = slot
+                        if best_slot != old_slot:
+                            _move(move_eid, best_slot)
+                            gap_round_moves += 1
+                            break
+            moved_y1_gap += gap_round_moves
+            if gap_round_moves == 0:
+                break
+        if moved_y1_gap > 0:
+            logs.append(
+                f"Pass khóa {lns_year1_anchor:02d} (ôn giữa hai ngày): đã dời {moved_y1_gap} môn."
+            )
+
+    def _year1_cross_day_violations() -> int:
+        if lns_year1_anchor <= 0:
+            return 0
+        count = 0
+        for sid, eids in student_to_exams.items():
+            if not _lns_is_year1(sid):
+                continue
+            entries = sorted(
+                (current[e] // sessions_per_day, e)
+                for e in eids
+                if e in current
+            )
+            for i in range(1, len(entries)):
+                d0, e0 = entries[i - 1]
+                d1, e1 = entries[i]
+                if d0 == d1:
+                    continue
+                need = min_prep_index_gap_between(
+                    exams[exam_index[e0]],
+                    exams[exam_index[e1]],
+                    prep_day_per_credit,
+                    min_prep_days,
+                    year1_allow_same_day=year1_allow_same_day,
+                    for_year1_student=True,
+                    same_calendar_day=False,
+                )
+                if need > 0 and (d1 - d0) < need:
+                    count += 1
+        return count
+
+    y1_before = _year1_cross_day_violations()
+    if y1_before > 0 and lns_year1_anchor > 0:
+        polish_moves = 0
+        for _polish in range(20):
+            if _year1_cross_day_violations() == 0:
+                break
+            step = 0
+            for sid in list(student_to_exams.keys()):
+                if not _lns_is_year1(sid):
+                    continue
+                eids = [e for e in student_to_exams[sid] if e in current and e not in fixed_slots]
+                entries = sorted(
+                    [(current[e], e) for e in eids],
+                    key=lambda x: x[0] // sessions_per_day,
+                )
+                for i in range(1, len(entries)):
+                    prev_slot, prev_eid = entries[i - 1]
+                    curr_slot, curr_eid = entries[i]
+                    prev_day = prev_slot // sessions_per_day
+                    curr_day = curr_slot // sessions_per_day
+                    if prev_day == curr_day:
+                        continue
+                    need = min_prep_index_gap_between(
+                        exams[exam_index[prev_eid]],
+                        exams[exam_index[curr_eid]],
+                        prep_day_per_credit,
+                        min_prep_days,
+                        year1_allow_same_day=year1_allow_same_day,
+                        for_year1_student=True,
+                        same_calendar_day=False,
+                    )
+                    if need <= 0 or (curr_day - prev_day) >= need:
+                        continue
+                    for move_eid, move_later in ((curr_eid, True), (prev_eid, False)):
+                        if move_eid in fixed_slots:
+                            continue
+                        old_slot = current[move_eid]
+                        anchor_day = curr_day if move_later else prev_day
+                        best_slot = old_slot
+                        best_key = (1, float("inf"))
+                        for slot in allowed_by_exam.get(move_eid, []):
+                            new_day = slot // sessions_per_day
+                            if move_later:
+                                if new_day <= anchor_day or (new_day - anchor_day) < need:
+                                    continue
+                            else:
+                                if new_day >= anchor_day or (anchor_day - new_day) < need:
+                                    continue
+                            if _conflict_at_slot(move_eid, slot):
+                                continue
+                            if _violates_max_per_day(move_eid, slot):
+                                continue
+                            if not _khoa_feasible(move_eid, slot):
+                                continue
+                            if not _prefix_feasible(move_eid, slot):
+                                continue
+                            if not _prep_feasible(move_eid, slot):
+                                continue
+                            sd, sev = _same_day_and_sev_for_exam(move_eid, slot)
+                            key = (
+                                sd,
+                                _vio_for_exam(move_eid, slot) + sev + _peak_cost(move_eid, slot),
+                            )
+                            if key < best_key:
+                                best_key = key
+                                best_slot = slot
+                        if best_slot != old_slot:
+                            _move(move_eid, best_slot)
+                            step += 1
+                            break
+                    if step:
+                        break
+                if step:
+                    break
+            polish_moves += step
+            if step == 0:
+                break
+        y1_after = _year1_cross_day_violations()
+        if polish_moves > 0 or y1_after < y1_before:
+            logs.append(
+                f"Pass tinh chỉnh khóa {lns_year1_anchor:02d}: vi phạm ôn giữa hai ngày "
+                f"{y1_before:,} → {y1_after:,} (đã dời {polish_moves} môn)."
+            )
+
+    def _lns_spread_peak_days(max_moves: int = 120) -> int:
+        """Dời môn từ ngày quá tải sang ngày còn trống nếu không tăng vi phạm ôn."""
+        day_load: Dict[int, int] = defaultdict(int)
+        for eid, slot in current.items():
+            if eid in exam_index:
+                day_load[slot // sessions_per_day] += exams[exam_index[eid]].size
+        if len(day_load) < 3:
+            return 0
+        avg_load = sum(day_load.values()) / len(day_load)
+        peak_thresh = avg_load * 1.12
+        low_thresh = avg_load * 0.88
+        peak_days = {d for d, load in day_load.items() if load > peak_thresh}
+        low_days = {d for d, load in day_load.items() if load < low_thresh}
+        if not peak_days or not low_days:
+            return 0
+        moved = 0
+        candidates = [
+            eid
+            for eid, slot in current.items()
+            if eid not in fixed_slots
+            and eid in exam_index
+            and (slot // sessions_per_day) in peak_days
+        ]
+        candidates.sort(
+            key=lambda e: -exams[exam_index[e]].size,
+        )
+        for eid in candidates:
+            if moved >= max_moves:
+                break
+            old_slot = current[eid]
+            old_day = old_slot // sessions_per_day
+            cur_vio = _vio_for_exam(eid, old_slot)
+            cur_sd, cur_sev = _same_day_and_sev_for_exam(eid, old_slot)
+            cur_peak = _peak_cost(eid, old_slot)
+            cur_key = (cur_sd, cur_vio + cur_sev + cur_peak)
+            best_slot = old_slot
+            best_key = cur_key
+            for slot in allowed_by_exam.get(eid, []):
+                new_day = slot // sessions_per_day
+                if new_day == old_day or new_day not in low_days:
+                    continue
+                if _conflict_at_slot(eid, slot):
+                    continue
+                if _violates_max_per_day(eid, slot):
+                    continue
+                if not _khoa_feasible(eid, slot):
+                    continue
+                if not _prefix_feasible(eid, slot):
+                    continue
+                if not _prep_feasible(eid, slot):
+                    continue
+                new_vio = _vio_for_exam(eid, slot)
+                new_sd, new_sev = _same_day_and_sev_for_exam(eid, slot)
+                new_peak = _peak_cost(eid, slot)
+                new_key = (new_sd, new_vio + new_sev + new_peak)
+                if new_key > cur_key:
+                    continue
+                if day_load[new_day] + exams[exam_index[eid]].size >= day_load[old_day]:
+                    continue
+                if new_key < best_key or (
+                    new_key[0] == best_key[0]
+                    and day_load[new_day] < day_load[best_slot // sessions_per_day]
+                ):
+                    best_key = new_key
+                    best_slot = slot
+            if best_slot != old_slot:
+                sz = exams[exam_index[eid]].size
+                day_load[old_day] -= sz
+                day_load[best_slot // sessions_per_day] += sz
+                _move(eid, best_slot)
+                moved += 1
+        return moved
+
+    def _try_move_exam_gap(
+        move_eid: str,
+        *,
+        anchor_day: int,
+        need: int,
+        move_later: bool,
+        same_cal: bool,
+        relax_khoa: bool,
+        relax_prefix: bool,
+    ) -> Optional[int]:
+        """Tìm slot tốt nhất để giãn cặp vi phạm ôn; None nếu không dời được."""
+        old_slot = current[move_eid]
+        best_slot = old_slot
+        best_key = (999, float("inf"))
+        for slot in allowed_by_exam.get(move_eid, []):
+            new_day = slot // sessions_per_day
+            if same_cal:
+                if new_day == anchor_day:
+                    continue
+            elif move_later:
+                if new_day <= anchor_day or (new_day - anchor_day) < need:
+                    continue
+            elif new_day >= anchor_day or (anchor_day - new_day) < need:
+                continue
+            if _conflict_at_slot(move_eid, slot):
+                continue
+            if _violates_max_per_day(move_eid, slot):
+                continue
+            if not relax_khoa and not _khoa_feasible(move_eid, slot):
+                continue
+            if not relax_prefix and not _prefix_feasible(move_eid, slot):
+                continue
+            if not _prep_feasible(move_eid, slot):
+                continue
+            sd, sev = _same_day_and_sev_for_exam(move_eid, slot)
+            key = (sd, _vio_for_exam(move_eid, slot) + sev + _peak_cost(move_eid, slot))
+            if key < best_key:
+                best_key = key
+                best_slot = slot
+        return best_slot if best_slot != old_slot else None
+
+    def _try_move_exam_gap_pair_only(
+        move_eid: str,
+        other_eid: str,
+        *,
+        anchor_day: int,
+        need: int,
+        move_later: bool,
+        same_cal: bool,
+        relax_khoa: bool,
+    ) -> Optional[int]:
+        """Chỉ sửa cặp (move_eid, other_eid) — dùng khi _prep_feasible quá chặt toàn cục."""
+        exam_m = exams[exam_index[move_eid]]
+        exam_o = exams[exam_index[other_eid]]
+        old_slot = current[move_eid]
+        best_slot = old_slot
+        for slot in allowed_by_exam.get(move_eid, []):
+            new_day = slot // sessions_per_day
+            if same_cal:
+                if new_day == anchor_day:
+                    continue
+            elif move_later:
+                if new_day <= anchor_day or (new_day - anchor_day) < need:
+                    continue
+            else:
+                if new_day >= anchor_day or (anchor_day - new_day) < need:
+                    continue
+            if _conflict_at_slot(move_eid, slot):
+                continue
+            if _violates_max_per_day(move_eid, slot):
+                continue
+            if not relax_khoa and not _khoa_feasible(move_eid, slot):
+                continue
+            other_day = current[other_eid] // sessions_per_day
+            gap = 0 if new_day == other_day else abs(new_day - other_day)
+            if gap < need:
+                continue
+            if slot != old_slot:
+                best_slot = slot
+                break
+        return best_slot if best_slot != old_slot else None
+
+    def _polish_all_cohort_prep_gaps(max_rounds: int = 20) -> int:
+        """Vòng 2: sửa ôn mọi khóa — ưu tiên cùng-ngày (0 ngày ôn) rồi gap=1."""
+        moved_total = 0
+        before_all, before_sd, _ = _compute_violation_score(current)
+        for _rnd in range(max_rounds):
+            round_moves = 0
+            total_vio, sd_vio, _ = _compute_violation_score(current)
+            if total_vio == 0:
+                break
+            # SV có vi phạm: ưu tiên nhiều môn & cùng-ngày trước
+            sid_scores: List[Tuple[float, str]] = []
+            for sid, eids in student_to_exams.items():
+                elist = [e for e in eids if e in current and e not in fixed_slots]
+                if len(elist) < 2:
+                    continue
+                entries = sorted(
+                    (current[e] // sessions_per_day, e) for e in elist
+                )
+                bad = 0.0
+                for i in range(1, len(entries)):
+                    d0, e0 = entries[i - 1]
+                    d1, e1 = entries[i]
+                    y1s = _lns_is_year1(sid)
+                    same = d0 == d1
+                    need = min_prep_index_gap_between(
+                        exams[exam_index[e0]],
+                        exams[exam_index[e1]],
+                        prep_day_per_credit,
+                        min_prep_days,
+                        year1_allow_same_day=year1_allow_same_day,
+                        for_year1_student=y1s,
+                        same_calendar_day=same,
+                    )
+                    gap = 0 if same else (d1 - d0)
+                    if need > 0 and gap < need:
+                        bad += (need - gap) * (3.0 if gap == 0 else 1.0)
+                if bad > 0:
+                    sid_scores.append((-bad, sid))
+            sid_scores.sort()
+            for _, sid in sid_scores[: min(800, len(sid_scores))]:
+                eids = [e for e in student_to_exams[sid] if e in current and e not in fixed_slots]
+                entries = sorted(
+                    [(current[e] // sessions_per_day, e) for e in eids],
+                    key=lambda x: (x[0], x[1]),
+                )
+                for i in range(1, len(entries)):
+                    prev_day, prev_eid = entries[i - 1]
+                    curr_day, curr_eid = entries[i]
+                    y1s = _lns_is_year1(sid)
+                    same_cal = prev_day == curr_day
+                    need = min_prep_index_gap_between(
+                        exams[exam_index[prev_eid]],
+                        exams[exam_index[curr_eid]],
+                        prep_day_per_credit,
+                        min_prep_days,
+                        year1_allow_same_day=year1_allow_same_day,
+                        for_year1_student=y1s,
+                        same_calendar_day=same_cal,
+                    )
+                    gap = 0 if same_cal else (curr_day - prev_day)
+                    if need <= 0 or gap >= need:
+                        continue
+                    fixed_pair = False
+                    for move_eid, anchor_day, later in (
+                        (curr_eid, prev_day, True),
+                        (prev_eid, curr_day, False),
+                    ):
+                        if move_eid in fixed_slots:
+                            continue
+                        for relax_khoa, relax_pfx in (
+                            (False, False),
+                            (True, False),
+                            (True, True),
+                        ):
+                            new_slot = _try_move_exam_gap(
+                                move_eid,
+                                anchor_day=anchor_day,
+                                need=need,
+                                move_later=later,
+                                same_cal=same_cal,
+                                relax_khoa=relax_khoa,
+                                relax_prefix=relax_pfx,
+                            )
+                            if new_slot is not None:
+                                _move(move_eid, new_slot)
+                                round_moves += 1
+                                fixed_pair = True
+                                break
+                        if fixed_pair:
+                            break
+                        other_eid = prev_eid if move_eid == curr_eid else curr_eid
+                        for relax_khoa in (False, True):
+                            new_slot = _try_move_exam_gap_pair_only(
+                                move_eid,
+                                other_eid,
+                                anchor_day=anchor_day,
+                                need=need,
+                                move_later=later,
+                                same_cal=same_cal,
+                                relax_khoa=relax_khoa,
+                            )
+                            if new_slot is not None:
+                                _move(move_eid, new_slot)
+                                round_moves += 1
+                                fixed_pair = True
+                                break
+                        if fixed_pair:
+                            break
+                    if fixed_pair:
+                        break
+            moved_total += round_moves
+            if round_moves == 0:
+                break
+        after_all, after_sd, _ = _compute_violation_score(current)
+        if moved_total > 0 or after_all < before_all:
+            logs.append(
+                f"Pass polish mọi khóa: vi phạm {before_all:,} → {after_all:,} "
+                f"(cùng-ngày {before_sd:,} → {after_sd:,}, đã dời {moved_total} môn)."
+            )
+        return moved_total
+
+    vio_before_polish, sd_before_polish, _ = _compute_violation_score(current)
+    if vio_before_polish > 600:
+        _polish_all_cohort_prep_gaps(
+            max_rounds=24 if vio_before_polish > 2500 else (18 if vio_before_polish > 1200 else 14)
+        )
+
+    spread_m = _lns_spread_peak_days()
+    if spread_m > 0:
+        logs.append(f"Pass san tải theo ngày: đã dời {spread_m} môn khỏi ngày quá đông.")
 
     return current, logs
 

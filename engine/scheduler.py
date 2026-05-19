@@ -23,6 +23,7 @@ from .diagnostics import (
     build_prefix_student_totals,
     enumerate_feasible_slots_for_exam,
     exam_khoa_nhom_keys,
+    prep_gap_violated,
     same_course_khoa_nhom_waiver,
 )
 from .diagnostics import (
@@ -32,7 +33,7 @@ from .diagnostics import (
     prep_hard_gap_days_for_pair,
     resolve_year1_cohort_anchor,
 )
-from .heuristic import HeuristicResult, lns_improve, schedule_greedy
+from .heuristic import HeuristicResult, heuristic_to_scheduled, lns_improve, schedule_greedy
 from .models import (
     Exam,
     Invigilator,
@@ -264,13 +265,13 @@ def solve(
     fixed_slots: Dict[str, int] | None = None,
     base_slots: Dict[str, int] | None = None,
     auto_relax: bool = True,
-    balance_weight: float = 1.0,
-    soft_slot_cap: int | None = None,
-    lns_iterations: int = 3,
-    lns_pool_size: int = 120,
+    balance_weight: float = 0.12,
+    soft_slot_cap: int | None = 1100,
+    lns_iterations: int = 10,
+    lns_pool_size: int = 250,
     progress_cb: Optional[Callable[[int, str], None]] = None,
     weekend_large_course_min_students: int = 0,
-    spread_prep_factor: float = 1.0,
+    spread_prep_factor: float = 2.6,
     student_cohort: Dict[str, int] | None = None,
     student_cohort_codes: Dict[str, str] | None = None,
     year1_cohort_anchor: int = 0,
@@ -304,6 +305,12 @@ def solve(
     total_capacity = sum(r.capacity for r in rooms) if rooms else None
 
     relaxations: List[str] = []
+    if window.has_per_cohort_windows:
+        n_distinct = len({(a, b) for a, b in window.khoa_lop_windows.values()})
+        relaxations.append(
+            f"Áp dụng Ke_hoach_thi theo Khoa_lop*: {len(window.khoa_lop_windows)} mã lớp, "
+            f"{n_distinct} khoảng ngày đợt thi."
+        )
 
     # ---- Greedy phase ----
     progress(15, "Bước 1/3: đang xếp lịch nhanh bằng thuật toán tham lam (DSATUR)…")
@@ -374,6 +381,113 @@ def solve(
             if improved and improved != final_assignment:
                 final_assignment = improved
                 method = "greedy+lns"
+            # Vòng LNS thứ hai khi vẫn còn hàng nghìn vi phạm (thường sau nới ôn khóa sau).
+            if final_assignment and len(final_assignment) >= len(exams) * 0.98:
+                tmp_sched = heuristic_to_scheduled(
+                    HeuristicResult(assignment=final_assignment, unplaced=[], relaxations=[]),
+                    exams,
+                    window,
+                    session_labels=session_labels,
+                )
+                sid_names = {
+                    sid: ""
+                    for ex in exams
+                    for sid in ex.student_ids
+                }
+                vio_n = len(
+                    detect_prep_violations(
+                        tmp_sched,
+                        exams,
+                        sid_names,
+                        prep_day_per_credit=prep_day_per_credit,
+                        min_prep_days=min_prep_days,
+                        student_cohort=student_cohort,
+                        student_cohort_codes=student_cohort_codes,
+                        year1_cohort_anchor=year1_cohort_anchor,
+                        year1_allow_same_day=year1_allow_same_day,
+                    )
+                )
+                if vio_n > 1800:
+                    progress(
+                        65,
+                        f"Bước 2b/3: LNS bổ sung — còn {vio_n:,} vi phạm ngày ôn…",
+                    )
+                    improved2, lns_logs2 = lns_improve(
+                        assignment=final_assignment,
+                        exams=exams,
+                        window=window,
+                        allowed_sessions_by_exam_id=allowed_sessions_by_exam_id,
+                        max_exams_per_day=max_exams_per_day,
+                        min_prep_days=min_prep_days,
+                        prep_day_per_credit=prep_day_per_credit,
+                        iterations=max(8, lns_iterations),
+                        pool_size=min(400, lns_pool_size + 100),
+                        soft_slot_cap=soft_slot_cap,
+                        fixed_slots=fixed_slots,
+                        session_half=session_half,
+                        progress_cb=progress,
+                        weekend_large_course_min_students=weekend_large_course_min_students,
+                        prefix_student_totals=prefix_totals,
+                        student_cohort=student_cohort,
+                        student_cohort_codes=student_cohort_codes,
+                        year1_cohort_anchor=year1_cohort_anchor,
+                        year1_allow_same_day=year1_allow_same_day,
+                    )
+                    lns_logs.extend(lns_logs2)
+                    if improved2:
+                        final_assignment = improved2
+                    # Vòng 3: polish ôn khi vẫn còn nhiều SV thiếu ngày nghỉ (đặc biệt gap=1).
+                    if final_assignment and len(final_assignment) >= len(exams) * 0.98:
+                        tmp_sched2 = heuristic_to_scheduled(
+                            HeuristicResult(
+                                assignment=final_assignment, unplaced=[], relaxations=[]
+                            ),
+                            exams,
+                            window,
+                            session_labels=session_labels,
+                        )
+                        vio_n2 = len(
+                            detect_prep_violations(
+                                tmp_sched2,
+                                exams,
+                                sid_names,
+                                prep_day_per_credit=prep_day_per_credit,
+                                min_prep_days=min_prep_days,
+                                student_cohort=student_cohort,
+                                student_cohort_codes=student_cohort_codes,
+                                year1_cohort_anchor=year1_cohort_anchor,
+                                year1_allow_same_day=year1_allow_same_day,
+                            )
+                        )
+                        if vio_n2 > 1000:
+                            progress(
+                                68,
+                                f"Bước 2c/3: LNS polish ôn — còn {vio_n2:,} vi phạm…",
+                            )
+                            improved3, lns_logs3 = lns_improve(
+                                assignment=final_assignment,
+                                exams=exams,
+                                window=window,
+                                allowed_sessions_by_exam_id=allowed_sessions_by_exam_id,
+                                max_exams_per_day=max_exams_per_day,
+                                min_prep_days=min_prep_days,
+                                prep_day_per_credit=prep_day_per_credit,
+                                iterations=max(12, lns_iterations),
+                                pool_size=min(450, lns_pool_size + 150),
+                                soft_slot_cap=soft_slot_cap,
+                                fixed_slots=fixed_slots,
+                                session_half=session_half,
+                                progress_cb=progress,
+                                weekend_large_course_min_students=weekend_large_course_min_students,
+                                prefix_student_totals=prefix_totals,
+                                student_cohort=student_cohort,
+                                student_cohort_codes=student_cohort_codes,
+                                year1_cohort_anchor=year1_cohort_anchor,
+                                year1_allow_same_day=year1_allow_same_day,
+                            )
+                            lns_logs.extend(lns_logs3)
+                            if improved3:
+                                final_assignment = improved3
         except Exception as exc:  # noqa: BLE001
             relaxations.append(f"Bỏ qua bước LNS: {exc}")
 
@@ -570,7 +684,16 @@ def detect_prep_violations(
             actual = (curr_date - prev_date).days
             if min_gap <= 0 and same_day and y1 and year1_allow_same_day:
                 continue
-            if actual + 1e-9 < min_gap:
+            if prep_gap_violated(
+                actual,
+                prev_exam,
+                curr_exam,
+                prep_day_per_credit,
+                min_prep_days,
+                year1_allow_same_day=year1_allow_same_day,
+                for_year1_student=y1,
+                same_calendar_day=same_day,
+            ):
                 violations.append(
                     PrepViolation(
                         student_id=sid,

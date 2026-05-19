@@ -114,9 +114,9 @@ def _run_pipeline(
     solver_time_limit,
     invigilators_per_room,
     optimize,
-    balance_weight=1.0,
-    soft_slot_cap=0,
-    lns_iterations=4,
+    balance_weight=0.12,
+    soft_slot_cap=1100,
+    lns_iterations=7,
     fixed_slots=None,
     base_slots=None,
     auto_relax=True,
@@ -125,7 +125,7 @@ def _run_pipeline(
     computer_fill_low=0.85,
     computer_fill_high=0.95,
     weekend_large_course_min_students=0,
-    spread_prep_factor=1.0,
+    spread_prep_factor=2.4,
     student_cohort=None,
     student_cohort_codes=None,
     year1_cohort_anchor=0,
@@ -255,6 +255,10 @@ with st.sidebar:
             min_value=1,
             value=2,
             step=1,
+            help=(
+                "Khóa năm 1 (theo cấu hình niên khóa) có thể tới 2 môn/ngày nếu bật ô trên. "
+                "Khóa cũ hơn engine tự giới hạn **1 môn/ngày** khi bật ngày ôn — giảm thi cùng ngày."
+            ),
         )
         weekend_large_min_sv = st.number_input(
             "Ngưỡng «môn rất đông»: chỉ thi cuối tuần (T7–CN)",
@@ -270,10 +274,13 @@ with st.sidebar:
         spread_prep_factor = st.slider(
             "Ưu tiên giãn lịch (điểm phạt trong bước tham lam)",
             min_value=1.0,
-            max_value=3.0,
-            value=1.75,
+            max_value=3.5,
+            value=2.6,
             step=0.05,
-            help="Càng cao thì càng cố tránh xếp hai môn của cùng sinh viên quá sát nhau (mục tiêu mềm).",
+            help=(
+                "Càng cao càng ưu tiên dùng nhiều ngày/slot trống để giữ ngày ôn (khuyên **2,5–2,7** "
+                "cho ~16k SV / ~1.600 ca). Mặc định 2,6 — cân bằng xếp hết ca và giảm vi phạm ôn."
+            ),
         )
         year1_cohort_anchor = st.number_input(
             "Niên khóa SV năm 1 hiện tại (2 số đầu, 4 ký tự cuối MalopHP)",
@@ -291,9 +298,10 @@ with st.sidebar:
             "Khóa năm 1: được thi cùng ngày (ôn giữa hai ngày thi khác nhau)",
             value=True,
             help=(
-                "Bật (khuyên dùng): SV khóa năm 1 **có thể thi 2 môn/ngày** (theo max môn/SV/ngày). "
-                "Chỉ bắt đủ **ngày ôn theo tín chỉ** khi hai môn rơi vào **hai ngày lịch khác nhau**. "
-                "Khóa cũ hơn có thể nới ôn khi lịch chật. Tắt = bắt khóa năm 1 đủ ôn kể cả cùng ngày (rất khó xếp hết)."
+                "Bật (khuyên dùng): engine **giữ ~1 môn/SV/ngày** (giống xếp tay). "
+                "Khóa năm 1 **không bắt** ngày ôn giữa hai môn nếu trùng ngày (hiếm). "
+                "Giữa hai **ngày khác nhau** vẫn cần đủ ngày ôn theo tín chỉ. "
+                "Tắt = bắt đủ ôn kể cả cùng ngày (rất khó xếp hết)."
             ),
         )
 
@@ -368,9 +376,9 @@ with st.sidebar:
             ],
             index=0,
             help=(
-                "Mặc định: cố tạo khoảng trống giữa các môn của cùng sinh viên.\n"
-                "Cân bằng: san tải theo ngày.\n"
-                "Nén: ít ngày thi hơn — dễ dồn đông SV một ngày."
+                "Mặc định (khuyên dùng): ưu tiên ngày ôn, dùng rộng cửa sổ thi còn trống.\n"
+                "Cân bằng: san tải theo ngày — có thể hy sinh một phần ôn.\n"
+                "Nén: ít ngày thi hơn — dễ tăng vi phạm 0 ngày ôn."
             ),
         )
         if "mạnh về số SV" in balance_mode:
@@ -380,26 +388,26 @@ with st.sidebar:
         elif balance_mode.startswith("Nén"):
             balance_weight = 0.05
         else:
-            balance_weight = 0.3
+            balance_weight = 0.12
         soft_slot_cap_value = st.number_input(
             "Ngưỡng mềm: một ca không nên quá bao nhiêu sinh viên (0 = tự tính)",
             min_value=0,
-            value=1500,
+            value=1100,
             step=100,
             help=(
-                "Dùng trong điểm phạt khi xếp: ca quá đông sẽ bị «đẩy» sang chỗ khác nếu có thể. "
-                "0 = lấy theo ~95% tổng chỗ ngồi phòng (nếu có file phòng), không thì 1500."
+                "Ca vượt ngưỡng bị đẩy sang slot/ngày khác nếu có thể. "
+                "Mặc định 1100 (khuyên 1000–1200) — tránh ca 1500+ SV, cân tải gần lịch mẫu."
             ),
         )
         lns_iterations = st.slider(
             "Số vòng sửa lịch cục bộ (LNS)",
             min_value=0,
-            max_value=8,
-            value=4,
+            max_value=15,
+            value=10,
             step=1,
             help=(
-                "Mỗi vòng xử lý khoảng 120 môn đang vi phạm nghỉ ôn nặng nhất. "
-                "4 vòng khuyến nghị; 0 = tắt LNS."
+                "Mỗi vòng xử lý ~200 môn vi phạm ôn nặng nhất. "
+                "Mặc định 10 vòng (khuyên 10–12) khi ~1.600 ca và còn hàng nghìn vi phạm ôn; 0 = tắt LNS."
             ),
         )
 
@@ -436,7 +444,10 @@ with up_col1:
     plan_file = st.file_uploader(
         "Bước 1 — Kế hoạch thi (Ke_hoach_thi.xlsx)",
         type=["xlsx"],
-        help="Bắt buộc. Cần cột «Ngày BD» và «Ngày kết thúc» để xác định khung ngày thi.",
+        help=(
+            "Bắt buộc. Cột «Ngày BD», «Ngày kết thúc» và «Khoa_lop*» (4 ký tự = hậu tố MalopHP). "
+            "Mỗi lớp/khóa có đợt thi riêng; hệ thống chỉ xếp ca trong khoảng ngày tương ứng."
+        ),
     )
     reg_file = st.file_uploader(
         "Bước 2 — Danh sách sinh viên đăng ký (DSSV_*.xlsx)",
@@ -485,6 +496,13 @@ if run_btn:
                 theory_text, oral_text, computer_text
             )
             window.sessions_per_day = len(session_labels)
+            if window.has_per_cohort_windows:
+                n_distinct = len({(a, b) for a, b in window.khoa_lop_windows.values()})
+                st.info(
+                    f"Kế hoạch thi: **{len(window.khoa_lop_windows)}** mã Khoa_lop* "
+                    f"({n_distinct} đợt ngày). Khung tổng {window.start_date} → {window.end_date}; "
+                    "mỗi ca chỉ xếp trong đợt của lớp (4 ký tự cuối MalopHP)."
+                )
 
             registrations = load_registrations(reg_path)
             rooms = load_rooms(rooms_path)
@@ -497,6 +515,7 @@ if run_btn:
                 registrations,
                 prep_day_per_credit=float(prep_day_per_credit),
                 max_exam_size=int(max_exam_size) if enable_split else None,
+                khoa_lop_windows=window.khoa_lop_windows or None,
             )
             y1_anchor = int(year1_cohort_anchor or 0)
             student_cohort_codes = build_student_cohort_code_map(
@@ -923,9 +942,9 @@ with tabs[5]:
                     solver_time_limit=cfg["solver_time_limit"],
                     invigilators_per_room=cfg["invigilators_per_room"],
                     optimize=cfg["optimize"],
-                    balance_weight=cfg.get("balance_weight", 1.0),
-                    soft_slot_cap=cfg.get("soft_slot_cap", 0),
-                    lns_iterations=cfg.get("lns_iterations", 3),
+                    balance_weight=cfg.get("balance_weight", 0.12),
+                    soft_slot_cap=cfg.get("soft_slot_cap", 1100),
+                    lns_iterations=cfg.get("lns_iterations", 7),
                     auto_relax=cfg["auto_relax"],
                     fixed_slots=fixed_slots,
                     base_slots=base_slots,
@@ -936,7 +955,7 @@ with tabs[5]:
                     weekend_large_course_min_students=int(
                         cfg.get("weekend_large_course_min_students", 0)
                     ),
-                    spread_prep_factor=float(cfg.get("spread_prep_factor", 1.0)),
+                    spread_prep_factor=float(cfg.get("spread_prep_factor", 2.4)),
                     student_cohort=state.get("student_cohort"),
                     student_cohort_codes=state.get("student_cohort_codes"),
                     year1_cohort_anchor=int(cfg.get("year1_cohort_anchor", 0) or 0),

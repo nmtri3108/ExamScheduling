@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -58,6 +58,12 @@ class ScheduleWindow:
     start_date: date
     end_date: date
     sessions_per_day: int = 2
+    # Khoa_lop* (4 ký tự cuối MalopHP) → (Ngày BD, Ngày kết thúc) theo Ke_hoach_thi.xlsx
+    khoa_lop_windows: Dict[str, Tuple[date, date]] = field(default_factory=dict)
+
+    @property
+    def has_per_cohort_windows(self) -> bool:
+        return bool(self.khoa_lop_windows)
 
     @property
     def total_days(self) -> int:

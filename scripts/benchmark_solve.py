@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Chạy solver trên data/ và in KPI (dùng kiểm tra sau tối ưu)."""
+# ruff: noqa: E402
 from __future__ import annotations
 
 import sys

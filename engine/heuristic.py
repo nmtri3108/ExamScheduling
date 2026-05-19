@@ -19,7 +19,6 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
-from math import ceil
 from typing import Dict, List, Optional, Tuple
 
 from .diagnostics import (
@@ -38,7 +37,6 @@ from .diagnostics import (
     prep_days_required_for_pair,
     min_prep_index_gap_between,
     prep_gap_violated,
-    prep_hard_gap_days_for_pair,
     same_course_khoa_nhom_waiver,
     weekday_at_day_index,
     UnplacedExamDiagnostic,
@@ -144,7 +142,6 @@ def schedule_greedy(
 
     # Mục tiêu phân bố đều: tổng SV / số ngày (giúp scoring biết khi nào "quá tải")
     total_student_demand = sum(e.size for e in exams)
-    target_per_day = total_student_demand / max(1, window.total_days)
     target_per_slot = total_student_demand / max(1, window.total_slots)
 
     relaxations: List[str] = []
@@ -280,6 +277,12 @@ def schedule_greedy(
     def _slots_for_exam(idx: int, relax_weekday: bool) -> List[int]:
         """Ô thời gian khả dĩ; nếu lọc thứ quá chặt → mở toàn bộ cửa sổ (đảm bảo có chỗ để đặt)."""
         exam = exams[idx]
+        pfx = str(exam.course_prefix_7 or "").strip()
+        large_n = int(prefix_tot.get(pfx, exam.size) if pfx else exam.size)
+        is_very_large = (
+            weekend_large_course_min_students > 0
+            and (large_n >= int(weekend_large_course_min_students) or int(exam.size) >= int(weekend_large_course_min_students))
+        )
         slots = enumerate_feasible_slots_for_exam(
             exam,
             window,
@@ -306,11 +309,19 @@ def schedule_greedy(
             )
             sessions = sorted({int(s) for s in sessions if 0 <= int(s) < spd})
             plan_days = exam_allowed_day_indices(exam, window)
-            if sessions and plan_days:
+            # Môn rất đông vẫn giữ nguyên lọc cuối tuần, không mở rộng ngày thường ở bước fallback cuối.
+            if sessions and plan_days and not is_very_large:
                 slots = [
                     d * spd + s for d in sorted(plan_days) for s in sessions
                 ]
         return slots
+
+    def _room_slot_cap_ok(idx: int, slot: int) -> bool:
+        if max_rooms_per_slot_per_format <= 0:
+            return True
+        fmt = _exam_format_code(idx)
+        projected_rooms = slot_room_demand_by_format.get((slot, fmt), 0.0) + _estimated_rooms_for_exam(idx)
+        return projected_rooms <= float(max_rooms_per_slot_per_format) + 1e-9
 
     def _try_place(
         idx: int,
@@ -322,6 +333,7 @@ def schedule_greedy(
         ignore_khoa_nhom: bool = False,
         ignore_prefix_anchor: bool = False,
         ignore_sunday_spread: bool = False,
+        ignore_room_slot_cap: bool = False,
     ) -> bool:
         exam = exams[idx]
         day, _ = _slot_to_day_session(slot, window.sessions_per_day)
@@ -340,6 +352,8 @@ def schedule_greedy(
                 lim = _max_exams_per_day_for_student(sid)
                 if lim > 0 and day_exams_per_student[(sid, day)] >= lim:
                     return False
+        if not ignore_room_slot_cap and not _room_slot_cap_ok(idx, slot):
+            return False
         # Ôn cứng: mọi SV khi chưa nới; nới chỉ bỏ ôn khóa cũ, giữ cứng cho năm 1.
         # Năm 1 được thi cùng ngày; giữa hai ngày khác nhau cần đủ ngày ôn theo tín chỉ.
         if min_prep_days > 0 or prep_day_per_credit > 0:
@@ -394,6 +408,8 @@ def schedule_greedy(
 
     def _force_commit(idx: int, slot: int) -> None:
         """Đặt bắt buộc — không kiểm ràng buộc (chỉ dùng khi ca không có SV khóa năm 1)."""
+        if not _room_slot_cap_ok(idx, int(slot)):
+            return
         _commit(idx, int(slot))
 
     def _safe_force_place(
@@ -445,7 +461,7 @@ def schedule_greedy(
         if plan_days and day in plan_days:
             if not _exam_has_year1(idx):
                 _force_commit(idx, int(slot))
-                return True
+                return exams[idx].exam_id in assignment
         return False
 
     def _commit(idx: int, slot: int) -> None:
@@ -786,6 +802,7 @@ def schedule_greedy(
         ignore_credit_prep: bool = False,
     ) -> List[int]:
         """Thử xếp lần lượt các môn còn lại; trả về list các môn vẫn không đặt được."""
+        nonlocal weekday_relax_logged
         still_unplaced: List[int] = []
         ordered = _flatten_pending_by_wave(list(remaining_state["pending"]))
         for idx in ordered:
@@ -1056,6 +1073,8 @@ def schedule_greedy(
                         ignore_sunday_spread=True,
                     ):
                         _force_commit(idx, slot_force)
+                        if exams[idx].exam_id not in assignment:
+                            still.append(idx)
                     else:
                         _commit(idx, slot_force)
             else:
@@ -1139,7 +1158,6 @@ def schedule_greedy(
         relaxations.append(
             f"Đặt bắt buộc {n_force} môn còn lại — ưu tiên slot còn đủ ngày ôn."
         )
-        weekday_relax_logged = True
         leftover = _place_leftover_loop(
             list(leftover),
             allow_conflict=False,
@@ -1201,6 +1219,8 @@ def schedule_greedy(
                             break
                     if not placed_em:
                         _force_commit(idx, int(best_em))
+                        if exams[idx].exam_id not in assignment:
+                            plan_blocked.append(idx)
             else:
                 plan_blocked.append(idx)
         if plan_blocked:
@@ -1281,7 +1301,6 @@ def schedule_greedy(
                         old_slot = assignment[move_eid]
                         if _uncommit(midx) is None:
                             continue
-                        placed = False
                         best_cand = old_slot
                         best_pen = float("inf")
                         for ign_khoa in (False, True):
@@ -1316,7 +1335,6 @@ def schedule_greedy(
                                 break
                         if best_cand != old_slot:
                             _commit(midx, best_cand)
-                            placed = True
                             round_moved += 1
                             fixed = True
                             break
@@ -2443,8 +2461,6 @@ def lns_improve(
         relax_khoa: bool,
     ) -> Optional[int]:
         """Chỉ sửa cặp (move_eid, other_eid) — dùng khi _prep_feasible quá chặt toàn cục."""
-        exam_m = exams[exam_index[move_eid]]
-        exam_o = exams[exam_index[other_eid]]
         old_slot = current[move_eid]
         best_slot = old_slot
         for slot in allowed_by_exam.get(move_eid, []):

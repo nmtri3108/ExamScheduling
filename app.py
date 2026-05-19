@@ -94,7 +94,7 @@ def _build_slot_config(theory: str, oral: str, computer: str):
                 all_labels.append(lbl)
     allowed_by_type: Dict[str, List[int]] = {}
     for etype, labels in by_type_labels.items():
-        allowed_by_type[etype] = [all_labels.index(l) for l in labels]
+        allowed_by_type[etype] = [all_labels.index(lbl) for lbl in labels]
     session_half = [label_half[lbl] for lbl in all_labels]
     return all_labels, allowed_by_type, session_half
 

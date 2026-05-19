@@ -13,14 +13,6 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from engine.diagnostics import (  # noqa: E402
-    build_student_cohort_code_map,
-    build_student_cohort_map,
-    prep_days_required_for_pair,
-    prep_gap_violated,
-)
-from engine.scheduler import prep_hard_gap_days_for_pair  # noqa: E402
-
 ALGO = Path("/Users/tringuyen/Downloads/ket_qua_xep_lich_thi (42).xlsx")
 MANUAL_RIENG = Path("/Users/tringuyen/Downloads/2520_ALL_DSThiRieng.xlsx")
 MANUAL_CHUNG_DS = Path("/Users/tringuyen/Downloads/2520DanhSachThiChung.xlsx")

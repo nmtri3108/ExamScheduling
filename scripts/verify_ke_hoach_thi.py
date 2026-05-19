@@ -92,7 +92,7 @@ def main() -> int:
 
         miss = verify_registrations_against_plan(args.dssv, plan)
         miss = miss[miss["Co_trong_ke_hoach"] == "Không"]
-        print(f"\n=== DSSV: MalopHP không có trong kế hoạch ===")
+        print("\n=== DSSV: MalopHP không có trong kế hoạch ===")
         print(f"  Số mã lớp: {len(miss)}")
         if len(miss):
             exit_code = max(exit_code, 2)

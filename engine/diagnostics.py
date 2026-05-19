@@ -528,7 +528,12 @@ def build_student_cohort_code_map(
     codes_by_sid: Dict[str, List[str]] = defaultdict(list)
     if registrations:
         for r in registrations:
-            code = cohort_code_from_malop(getattr(r, "section_id", ""))
+            raw_khoa = str(getattr(r, "khoa", "") or "").strip()
+            if raw_khoa.endswith(".0") and raw_khoa[:-2].isdigit():
+                raw_khoa = raw_khoa[:-2]
+            code = raw_khoa[:2] if raw_khoa else ""
+            if not code:
+                code = cohort_code_from_malop(getattr(r, "section_id", ""))
             if code:
                 codes_by_sid[str(r.student_id)].append(code)
     for ex in exams:
@@ -753,12 +758,23 @@ def enumerate_feasible_slots_for_exam(
     if not sessions:
         return []
     totals = prefix_totals or {}
+    pfx = _malop_prefix_7_for_exam(exam)
+    is_weekend_large = False
+    if weekend_large_min_students > 0:
+        n = totals.get(pfx, exam.size if pfx else exam.size)
+        is_weekend_large = int(n) >= int(weekend_large_min_students) or int(exam.size) >= int(
+            weekend_large_min_students
+        )
     allowed_days = exam_allowed_day_indices(exam, window)
     slots: List[int] = []
     for d in range(window.total_days):
         if d not in allowed_days:
             continue
-        if not relax_weekday_rule and weekend_large_min_students > 0:
+        # Môn rất đông (>= ngưỡng) luôn giữ quy tắc cuối tuần, kể cả khi relax_weekday_rule=True.
+        apply_weekday_rule = weekend_large_min_students > 0 and (
+            not relax_weekday_rule or is_weekend_large
+        )
+        if apply_weekday_rule:
             if not day_allowed_for_exam_weekday_rule(
                 exam, d, window, weekend_large_min_students, totals
             ):
@@ -1181,9 +1197,6 @@ def compute_kpi(
     kpi.prep_violation_students = len({v.student_id for v in violations})
     code_map = student_cohort_codes or build_student_cohort_code_map(
         exams, year1_anchor=year1_cohort_anchor
-    )
-    cohort_map = student_cohort if student_cohort is not None else build_student_cohort_map(
-        exams, year1_anchor=year1_cohort_anchor, student_cohort_codes=code_map
     )
     anchor = resolve_year1_cohort_anchor(year1_cohort_anchor, exams, code_map)
     kpi.newest_cohort_code = anchor

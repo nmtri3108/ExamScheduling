@@ -36,7 +36,6 @@ from .diagnostics import (
 from .heuristic import HeuristicResult, heuristic_to_scheduled, lns_improve, schedule_greedy
 from .models import (
     Exam,
-    Invigilator,
     PrepViolation,
     Room,
     ScheduleWindow,
@@ -538,7 +537,6 @@ def solve(
 
     elapsed = time.time() - start_time
     remaining = max(0.0, solver_time_limit_seconds - elapsed)
-    final_slots: Optional[List[int]] = None
 
     # CP-SAT polish chỉ chạy khi instance đủ nhỏ (tránh dựng model 10M+ vars).
     # Ngưỡng dựa trên: số môn × số slot ≤ 500_000, số xung đột ≤ 60_000.

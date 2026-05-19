@@ -112,23 +112,37 @@ def _room_matches_exam_format(fmt: int, room: Room) -> bool:
     return True
 
 
-def _eligible_rooms(fmt: int, pool: List[Room]) -> List[Room]:
+def _eligible_rooms(fmt: int, pool: List[Room], need: int = 0) -> List[Room]:
     if not pool:
         return []
     matched = [r for r in pool if _room_matches_exam_format(fmt, r)]
-    if matched:
-        return matched
-    # Không còn phòng đúng mã: nới theo quy tắc cũ (theory/computer/any) để tránh treo lịch
-    if fmt == 2:
-        out = [r for r in pool if _norm_room_type(r.room_type) in _COMP_TYPES]
-        return out or list(pool)
-    if fmt == 1:
-        out = [r for r in pool if _norm_room_type(r.room_type) in _THEORY_TYPES]
-        return out or list(pool)
     if fmt == 3:
+        # Vấn đáp vẫn ưu tiên chặt đúng loại phòng.
+        if matched:
+            return matched
         out = [r for r in pool if _norm_room_type(r.room_type) in _ORAL_TYPES]
         return out or list(pool)
-    return list(pool)
+
+    # Lý thuyết/trắc nghiệm: ưu tiên đúng loại, nhưng nếu không đủ thì nới sang phòng còn trống
+    # để tránh báo thiếu phòng sớm.
+    if matched:
+        matched_cap = sum(r.capacity for r in matched)
+        if need <= 0 or matched_cap >= int(need):
+            return matched
+
+    def _compat_rank(room: Room) -> int:
+        if _room_matches_exam_format(fmt, room):
+            return 0
+        rt = _norm_room_type(room.room_type)
+        if rt in ("any", ""):
+            return 1
+        if fmt == 2 and rt in _COMP_TYPES:
+            return 1
+        if fmt == 1 and rt in _THEORY_TYPES:
+            return 1
+        return 2
+
+    return sorted(pool, key=lambda r: (_compat_rank(r), -r.capacity))
 
 
 def _capacity_target_range(need: int, util_low: float, util_high: float) -> Tuple[int, int]:
@@ -280,6 +294,7 @@ def assign_rooms_and_invigilators(
     for (slot_day, slot_session), exam_list in by_slot.items():
         used_ids: Set[str] = set()
         slot_rooms_used_by_format: Dict[int, int] = defaultdict(int)
+        warned_slot_fmt: Set[int] = set()
         for sched_exam in sorted(
             exam_list,
             key=lambda x: exam_map[x.exam_id].size if x.exam_id in exam_map else 0,
@@ -298,7 +313,7 @@ def assign_rooms_and_invigilators(
                 or ""
             )
             eligible = [r for r in room_pool if r.room_id not in used_ids]
-            eligible = _eligible_rooms(fmt, eligible)
+            eligible = _eligible_rooms(fmt, eligible, need=need)
             if preferred_zone:
                 z = str(preferred_zone).strip().upper()
                 eligible.sort(key=lambda r: (0 if _zone_key(r) == z else 1, -r.capacity))
@@ -335,7 +350,9 @@ def assign_rooms_and_invigilators(
             if (
                 max_rooms_per_slot_per_format > 0
                 and slot_rooms_used_by_format[fmt] > int(max_rooms_per_slot_per_format)
+                and fmt not in warned_slot_fmt
             ):
+                warned_slot_fmt.add(fmt)
                 report.soft_warnings.append(
                     f"Vượt ngưỡng mềm {max_rooms_per_slot_per_format} phòng "
                     f"loại {fmt} tại {slot_day} ca {slot_session} "

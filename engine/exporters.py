@@ -10,6 +10,14 @@ from .i18n import hien_thi_loai_hinh
 from .models import Exam, PrepViolation, ScheduledExam
 
 
+def _sid_candidates(sid: str) -> list[str]:
+    s = str(sid or "").strip()
+    out = [s]
+    if s.endswith(".0") and s[:-2]:
+        out.append(s[:-2])
+    return out
+
+
 def _student_room_and_split_code(item: ScheduledExam, sid: str) -> tuple[str, str]:
     """Phòng vật lý và mã ghép cho một SV khi đã chia nhóm theo phòng."""
     groups = getattr(item, "room_student_groups", None) or []
@@ -129,17 +137,26 @@ def student_view_dataframe(
         if not exam:
             continue
         for sid in exam.student_ids:
+            sid_s = str(sid).strip()
             rid, split_code = _student_room_and_split_code(item, sid)
             phong_cell = rid if rid else ", ".join(item.room_ids)
             cohort = ""
             if student_cohort_codes:
-                cohort = str(student_cohort_codes.get(sid, "") or "").strip()
+                for key in _sid_candidates(sid_s):
+                    cohort = str(student_cohort_codes.get(key, "") or "").strip()
+                    if cohort:
+                        break
             if not cohort and exam.section_ids:
                 cohort = cohort_code_from_malop(exam.section_ids[0])
+            student_name = ""
+            for key in _sid_candidates(sid_s):
+                student_name = student_name_map.get(key, "")
+                if student_name:
+                    break
             rows.append(
                 {
-                    "Ma_sinh_vien": sid,
-                    "Ten_sinh_vien": student_name_map.get(sid, ""),
+                    "Ma_sinh_vien": sid_s,
+                    "Ten_sinh_vien": student_name,
                     "Ma_ca_thi": item.exam_id,
                     "MalopHP": _exam_malophp_cell(exam),
                     "Nien_khoa": cohort,

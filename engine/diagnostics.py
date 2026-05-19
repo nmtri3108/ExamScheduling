@@ -347,9 +347,23 @@ def khoa_nhom_from_malop(section_id: str) -> str:
     return s[-4:] if len(s) >= 4 else s
 
 
+def normalize_khoa_lop_key(value: str) -> str:
+    s = str(value or "").strip()
+    if s.endswith(".0") and s[:-2].isdigit():
+        s = s[:-2]
+    if s.isdigit():
+        return s.zfill(4)
+    return s
+
+
 def exam_khoa_nhom_keys(exam: Exam) -> frozenset[str]:
-    """Tập Khoa_nhom từ mọi MalopHP (section_id) của ca thi."""
-    keys: set[str] = set()
+    """Tập Khoa_lớp cho ca thi: ưu tiên cột explicit, fallback về 4 ký tự cuối MalopHP."""
+    keys: set[str] = {
+        normalize_khoa_lop_key(k) for k in getattr(exam, "khoa_lop_keys", []) if str(k).strip()
+    }
+    keys.discard("")
+    if keys:
+        return frozenset(keys)
     for sec in exam.section_ids:
         k = khoa_nhom_from_malop(sec)
         if k:
@@ -358,7 +372,14 @@ def exam_khoa_nhom_keys(exam: Exam) -> frozenset[str]:
 
 
 def exam_max_cohort_index(exam: Exam) -> int:
-    """Khóa số lớn nhất trên ca (legacy / hiển thị)."""
+    """Khóa số lớn nhất trên ca (ưu tiên cột khóa explicit)."""
+    from_codes = []
+    for code in getattr(exam, "cohort_codes", []):
+        n = cohort_numeric_value(str(code))
+        if n is not None:
+            from_codes.append(n)
+    if from_codes:
+        return max(from_codes)
     mx = 0
     for sec in exam.section_ids:
         mx = max(mx, cohort_index_from_malop(sec))
@@ -366,8 +387,11 @@ def exam_max_cohort_index(exam: Exam) -> int:
 
 
 def exam_min_cohort_wave(exam: Exam, year1_anchor: int) -> int:
-    """Sóng ưu tiên của ca = sóng tốt nhất (nhỏ nhất) trong các MalopHP của ca."""
-    waves = [cohort_wave_index(cohort_code_from_malop(sec), year1_anchor) for sec in exam.section_ids]
+    """Sóng ưu tiên của ca = sóng tốt nhất (nhỏ nhất) trong các mã khóa của ca."""
+    codes = [str(c) for c in getattr(exam, "cohort_codes", []) if str(c).strip()]
+    if not codes:
+        codes = [cohort_code_from_malop(sec) for sec in exam.section_ids]
+    waves = [cohort_wave_index(code, year1_anchor) for code in codes]
     if not waves:
         return _COHORT_LOW_PRIORITY_WAVE
     return min(waves)

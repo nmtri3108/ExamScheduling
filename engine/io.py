@@ -83,6 +83,49 @@ def _course_prefix_7(section_id: str) -> str:
     return s[:7] if len(s) >= 7 else s
 
 
+def _normalize_code(value: object) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    s = str(value).strip()
+    if s.endswith(".0") and s[:-2].isdigit():
+        s = s[:-2]
+    return s
+
+
+def _normalize_khoa_lop(value: object) -> str:
+    s = _normalize_code(value)
+    if not s:
+        return ""
+    return s.zfill(4) if s.isdigit() else s
+
+
+def _normalize_khoa_code(value: object) -> str:
+    s = _normalize_code(value)
+    if not s:
+        return ""
+    if len(s) >= 2 and s[:2].isdigit():
+        return s[:2]
+    if s.isdigit():
+        return s.zfill(2)[-2:]
+    return s[:2]
+
+
+def _find_column_by_folded_alias(columns: List[str], aliases: set[str]) -> str | None:
+    for col in columns:
+        if _fold_header_label(col) in aliases:
+            return col
+    return None
+
+
+def _parse_int_priority(value: object) -> int:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return 0
+    try:
+        return max(0, int(float(value)))
+    except (TypeError, ValueError):
+        return 0
+
+
 # ---------------------------------------------------------------------------
 # Plan / window
 # ---------------------------------------------------------------------------
@@ -123,10 +166,11 @@ def load_schedule_window(plan_path: str | Path) -> ScheduleWindow:
 
 def load_registrations(reg_path: str | Path) -> List[Registration]:
     df = pd.read_excel(reg_path, sheet_name=0)
-    required_cols = {"MaHS", "TenSV", "MalopHP", "TenLopHP", "SoTC"}
-    missing = required_cols.difference(df.columns)
+    base_required = {"MaHS", "TenSV", "TenLopHP", "SoTC"}
+    missing = base_required.difference(df.columns)
     if missing:
         raise ValueError(f"File đăng ký thiếu cột: {sorted(missing)}")
+    ma_lop_col = "MalopHP" if "MalopHP" in df.columns else None
 
     _FMT_COL_FOLDED = frozenset(
         {
@@ -137,6 +181,18 @@ def load_registrations(reg_path: str | Path) -> List[Registration]:
             "loaihinhthucthi",
         }
     )
+    _MA_HOC_PHAN_FOLDED = frozenset({"mahocphan", "mahp", "mahocphanhocphan", "mahocphanthi"})
+    _KHOA_FOLDED = frozenset({"khoa", "khoasv", "nienkhoa", "ma_khoa", "makhoa"})
+    _KHOA_LOP_FOLDED = frozenset({"khoalop", "khoalopstar", "makhoalop", "khoa_lop"})
+    _PRIORITY_FOLDED = frozenset(
+        {"thutuutien", "thutuuutien", "uutien", "priority", "thutu", "thu_tu_uu_tien"}
+    )
+
+    ma_hoc_phan_col = _find_column_by_folded_alias(list(df.columns), set(_MA_HOC_PHAN_FOLDED))
+    khoa_col = _find_column_by_folded_alias(list(df.columns), set(_KHOA_FOLDED))
+    khoa_lop_col = _find_column_by_folded_alias(list(df.columns), set(_KHOA_LOP_FOLDED))
+    priority_col = _find_column_by_folded_alias(list(df.columns), set(_PRIORITY_FOLDED))
+
     fmt_col = None
     for col in df.columns:
         if _fold_header_label(col) in _FMT_COL_FOLDED:
@@ -148,20 +204,83 @@ def load_registrations(reg_path: str | Path) -> List[Registration]:
                 fmt_col = candidate
                 break
 
-    use_cols = list(required_cols)
+    if ma_lop_col is None and ma_hoc_phan_col is None:
+        raise ValueError(
+            "File đăng ký cần có ít nhất một cột mã lớp/mã học phần: "
+            "MalopHP hoặc MaHocPhan."
+        )
+
+    use_cols = list(base_required)
+    if ma_lop_col:
+        use_cols.append(ma_lop_col)
+    if ma_hoc_phan_col:
+        use_cols.append(ma_hoc_phan_col)
+    if khoa_col:
+        use_cols.append(khoa_col)
+    if khoa_lop_col:
+        use_cols.append(khoa_lop_col)
+    if priority_col:
+        use_cols.append(priority_col)
     if fmt_col:
         use_cols.append(fmt_col)
 
     df = df[use_cols].copy()
+    rename_map = {}
+    if ma_lop_col and ma_lop_col != "MalopHP":
+        rename_map[ma_lop_col] = "MalopHP"
+    if ma_hoc_phan_col:
+        rename_map[ma_hoc_phan_col] = "MaHocPhan"
+    if khoa_col:
+        rename_map[khoa_col] = "Khoa"
+    if khoa_lop_col:
+        rename_map[khoa_lop_col] = "Khoa_Lop"
+    if priority_col:
+        rename_map[priority_col] = "ThuTuUuTien"
     if fmt_col:
-        df = df.rename(columns={fmt_col: "MaHinhThuc"})
-    df = df.dropna(subset=["MaHS", "MalopHP", "TenLopHP"])
+        rename_map[fmt_col] = "MaHinhThuc"
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    if "MalopHP" not in df.columns:
+        df["MalopHP"] = ""
+    if "MaHocPhan" not in df.columns:
+        df["MaHocPhan"] = ""
+    if "Khoa" not in df.columns:
+        df["Khoa"] = ""
+    if "Khoa_Lop" not in df.columns:
+        df["Khoa_Lop"] = ""
+    if "ThuTuUuTien" not in df.columns:
+        df["ThuTuUuTien"] = 0
+
+    df = df.dropna(subset=["MaHS", "TenLopHP"])
     df["SoTC"] = pd.to_numeric(df["SoTC"], errors="coerce").fillna(2.0)
     df["MaHS"] = df["MaHS"].astype(str).str.strip()
-    df["MalopHP"] = df["MalopHP"].astype(str).str.strip()
+    df["MalopHP"] = df["MalopHP"].map(_normalize_code)
+    df["MaHocPhan"] = df["MaHocPhan"].map(_normalize_code)
+    df["Khoa"] = df["Khoa"].map(_normalize_khoa_code)
+    df["Khoa_Lop"] = df["Khoa_Lop"].map(_normalize_khoa_lop)
+    df["ThuTuUuTien"] = df["ThuTuUuTien"].map(_parse_int_priority)
+    # Fallback để giữ tương thích dữ liệu cũ chỉ có MalopHP.
+    fallback_hp = df["MalopHP"].map(lambda s: str(s)[:12] if str(s) else "")
+    df["MaHocPhan"] = df["MaHocPhan"].where(df["MaHocPhan"].astype(bool), fallback_hp)
+    fallback_khoa_lop = df["MalopHP"].map(lambda s: str(s)[-4:] if len(str(s)) >= 4 else "")
+    df["Khoa_Lop"] = df["Khoa_Lop"].where(df["Khoa_Lop"].astype(bool), fallback_khoa_lop)
+    fallback_khoa = df["Khoa_Lop"].map(lambda s: str(s)[:2] if len(str(s)) >= 2 else "")
+    df["Khoa"] = df["Khoa"].where(df["Khoa"].astype(bool), fallback_khoa)
+    # Nếu không có MalopHP, tạo mã ổn định từ mã học phần + khóa_lớp để hỗ trợ dedupe.
+    df["MalopHP"] = df["MalopHP"].where(
+        df["MalopHP"].astype(bool),
+        df.apply(
+            lambda r: f"{r['MaHocPhan']}_{r['Khoa_Lop']}".strip("_")
+            if str(r["MaHocPhan"]).strip() or str(r["Khoa_Lop"]).strip()
+            else "",
+            axis=1,
+        ),
+    )
     df["TenLopHP"] = df["TenLopHP"].astype(str).str.strip()
     df["TenSV"] = df["TenSV"].astype(str).fillna("").str.strip()
-    df = df.drop_duplicates(subset=["MaHS", "MalopHP"])
+    df = df[df["MalopHP"].astype(bool) | df["MaHocPhan"].astype(bool)]
+    df = df.drop_duplicates(subset=["MaHS", "MalopHP", "MaHocPhan"])
 
     rows: List[Registration] = []
     for row in df.itertuples(index=False):
@@ -175,6 +294,10 @@ def load_registrations(reg_path: str | Path) -> List[Registration]:
                 section_id=row.MalopHP,
                 course_name=row.TenLopHP,
                 credits=float(row.SoTC),
+                ma_hoc_phan=getattr(row, "MaHocPhan", "") or "",
+                khoa=getattr(row, "Khoa", "") or "",
+                khoa_lop=getattr(row, "Khoa_Lop", "") or "",
+                priority_order=int(getattr(row, "ThuTuUuTien", 0) or 0),
                 exam_format=fmt_val,
             )
         )
@@ -199,7 +322,7 @@ def build_exams(
             None = không áp trần (giữ nguyên một ca / đề chung theo logic nhóm).
     """
     if not registrations:
-        return [], {}, {}
+        return [], {}, {}, {}
 
     df = pd.DataFrame(
         [
@@ -212,33 +335,52 @@ def build_exams(
                 "credits": r.credits,
                 "exam_format": r.exam_format,
                 "prefix7": _course_prefix_7(r.section_id),
+                "ma_hoc_phan": _normalize_code(r.ma_hoc_phan),
+                "khoa": _normalize_khoa_code(r.khoa),
+                "khoa_lop": _normalize_khoa_lop(r.khoa_lop),
+                "priority_order": int(r.priority_order or 0),
             }
             for r in registrations
         ]
     )
-    df["cohort_code"] = df["section_id"].map(cohort_code_from_malop)
+    df["cohort_code"] = df["khoa"].where(
+        df["khoa"].astype(bool),
+        df["section_id"].map(cohort_code_from_malop),
+    )
     df["cohort_idx"] = df["section_id"].map(cohort_index_from_malop)
+    df["course_group_key"] = df["ma_hoc_phan"].where(
+        df["ma_hoc_phan"].astype(bool), df["course_norm"]
+    )
 
-    section_counts = df.groupby("course_norm")["section_id"].nunique()
+    section_counts = df.groupby("course_group_key")["section_id"].nunique()
     thr = int(common_section_threshold)
     if thr < 2:
         thr = 3
     common_exam_courses = set(section_counts[section_counts >= thr].index.tolist())
 
     if khoa_lop_windows:
-        df["plan_bucket"] = df["section_id"].map(
-            lambda s: plan_bucket_for_section(s, khoa_lop_windows)
-        )
+        def _plan_bucket_row(row: pd.Series) -> object:
+            kl = str(row["khoa_lop"] or "").strip()
+            if kl and kl in khoa_lop_windows:
+                bounds = khoa_lop_windows[kl]
+                return ("plan", bounds[0].isoformat(), bounds[1].isoformat())
+            return plan_bucket_for_section(row["section_id"], khoa_lop_windows)
+
+        df["plan_bucket"] = df.apply(_plan_bucket_row, axis=1)
 
         def _exam_group_key(row: pd.Series) -> object:
-            if row["course_norm"] in common_exam_courses:
-                return (row["course_norm"], row["plan_bucket"])
+            if row["course_group_key"] in common_exam_courses:
+                return (row["course_group_key"], row["plan_bucket"])
             return row["section_id"]
 
         df["exam_group"] = df.apply(_exam_group_key, axis=1)
     else:
         df["exam_group"] = df.apply(
-            lambda x: x["course_norm"] if x["course_norm"] in common_exam_courses else x["section_id"],
+            lambda x: (
+                x["course_group_key"]
+                if x["course_group_key"] in common_exam_courses
+                else x["section_id"]
+            ),
             axis=1,
         )
 
@@ -250,7 +392,12 @@ def build_exams(
         credits = float(exam_df["credits"].mode().iloc[0])
         section_ids = sorted(exam_df["section_id"].unique().tolist())
         student_ids = sorted(exam_df["student_id"].unique().tolist())
-        course_id = _infer_course_id_from_sections(section_ids)
+        mhp_mode = exam_df["ma_hoc_phan"][exam_df["ma_hoc_phan"].astype(bool)]
+        course_id = (
+            str(mhp_mode.mode().iloc[0]).strip()
+            if not mhp_mode.empty
+            else _infer_course_id_from_sections(section_ids)
+        )
         normalized = _normalize_text(course_name)
         fmt_series = exam_df["exam_format"].dropna()
         if not fmt_series.empty:
@@ -263,10 +410,16 @@ def build_exams(
         else:
             exam_format = _infer_exam_format_from_name(normalized)
         exam_type = _format_to_exam_type(exam_format)
-        prefix7 = str(exam_df["prefix7"].mode().iloc[0]) if len(exam_df) else ""
+        prefix7 = (str(course_id).strip()[:7] if str(course_id).strip() else "")
+        if not prefix7 and len(exam_df):
+            prefix7 = str(exam_df["prefix7"].mode().iloc[0])
         if not prefix7 and section_ids:
             prefix7 = _course_prefix_7(section_ids[0])
-        priority = 10 if (exam_format == 3 or any(k in normalized for k in PBL_KEYWORDS)) else 0
+        priority_from_col = int(exam_df["priority_order"].max()) if len(exam_df) else 0
+        priority_from_type = 10 if (exam_format == 3 or any(k in normalized for k in PBL_KEYWORDS)) else 0
+        priority = max(priority_from_col, priority_from_type)
+        khoa_lop_keys = sorted({k for k in exam_df["khoa_lop"].tolist() if str(k).strip()})
+        cohort_codes = sorted({k for k in exam_df["cohort_code"].tolist() if str(k).strip()})
 
         # Auto-split nếu vượt ngưỡng — chia theo section_ids để mỗi part có SV ~ bằng nhau.
         if max_exam_size and len(student_ids) > max_exam_size:
@@ -316,6 +469,20 @@ def build_exams(
                             student_ids=chunk,
                             exam_format=exam_format,
                             course_prefix_7=prefix7,
+                            khoa_lop_keys=sorted(
+                                {
+                                    str(v).strip()
+                                    for v in exam_df[exam_df["student_id"].isin(chunk)]["khoa_lop"].tolist()
+                                    if str(v).strip()
+                                }
+                            ),
+                            cohort_codes=sorted(
+                                {
+                                    str(v).strip()
+                                    for v in exam_df[exam_df["student_id"].isin(chunk)]["cohort_code"].tolist()
+                                    if str(v).strip()
+                                }
+                            ),
                             priority=priority,
                             prep_days=round(credits * prep_day_per_credit, 2),
                         )
@@ -333,6 +500,8 @@ def build_exams(
                     student_ids=student_ids,
                     exam_format=exam_format,
                     course_prefix_7=prefix7,
+                    khoa_lop_keys=khoa_lop_keys,
+                    cohort_codes=cohort_codes,
                     priority=priority,
                     prep_days=round(credits * prep_day_per_credit, 2),
                 )

@@ -146,12 +146,17 @@ def _pick_rooms_utilization(
     pool: List[Room],
     util_low: float,
     util_high: float,
+    target_students_per_room: float | None = None,
 ) -> List[Room]:
     """FFD: ưu tiên phòng lớn trước, đạt tổng capacity trong [lo, hi] nếu có thể, luôn ≥ need."""
     if need <= 0 or not pool:
         return []
     lo, hi = _capacity_target_range(need, util_low, util_high)
-    ordered = sorted(pool, key=lambda r: -r.capacity)
+    if target_students_per_room is not None and target_students_per_room > 0:
+        tgt = float(target_students_per_room)
+        ordered = sorted(pool, key=lambda r: (abs(float(r.capacity) - tgt), -r.capacity))
+    else:
+        ordered = sorted(pool, key=lambda r: -r.capacity)
     chosen: List[Room] = []
     total = 0
     for r in ordered:
@@ -186,6 +191,7 @@ def _pick_rooms_utilization_prefer_same_zone(
     pool: List[Room],
     util_low: float,
     util_high: float,
+    target_students_per_room: float | None = None,
 ) -> List[Room]:
     """Giống FFD utilization nhưng ưu tiên tất cả phòng lấy từ cùng một khu nếu đủ sức chứa."""
     if need <= 0 or not pool:
@@ -199,7 +205,9 @@ def _pick_rooms_utilization_prefer_same_zone(
         cap = sum(r.capacity for r in rs)
         if cap < need:
             continue
-        picked = _pick_rooms_utilization(need, rs, util_low, util_high)
+        picked = _pick_rooms_utilization(
+            need, rs, util_low, util_high, target_students_per_room=target_students_per_room
+        )
         seats = sum(r.capacity for r in picked)
         if seats < need:
             continue
@@ -210,7 +218,9 @@ def _pick_rooms_utilization_prefer_same_zone(
             best_score = score
     if best is not None:
         return best
-    return _pick_rooms_utilization(need, pool, util_low, util_high)
+    return _pick_rooms_utilization(
+        need, pool, util_low, util_high, target_students_per_room=target_students_per_room
+    )
 
 
 def _pick_rooms_oral(pool: List[Room], need: int) -> List[Room]:
@@ -229,6 +239,7 @@ def _pick_rooms_oral(pool: List[Room], need: int) -> List[Room]:
 @dataclass
 class RoomAssignmentReport:
     overflows: List[str] = field(default_factory=list)
+    soft_warnings: List[str] = field(default_factory=list)
     invigilator_shortage: List[str] = field(default_factory=list)
     room_usage: Dict[str, int] = field(default_factory=dict)
     invigilator_usage: Dict[str, int] = field(default_factory=dict)
@@ -244,6 +255,10 @@ def assign_rooms_and_invigilators(
     theory_fill_high: float = 1.00,
     computer_fill_low: float = 0.85,
     computer_fill_high: float = 0.95,
+    target_students_per_room_by_exam_format: Dict[int, float] | None = None,
+    preferred_zone_by_session_label: Dict[str, str] | None = None,
+    preferred_zone_by_session: Dict[int, str] | None = None,
+    max_rooms_per_slot_per_format: int = 50,
 ) -> RoomAssignmentReport:
     """Phân phòng & giám thị in-place vào `scheduled`."""
     report = RoomAssignmentReport()
@@ -252,6 +267,9 @@ def assign_rooms_and_invigilators(
         return report
 
     room_pool = sorted(rooms, key=lambda r: r.capacity, reverse=True)
+    target_students_per_room_by_exam_format = target_students_per_room_by_exam_format or {}
+    preferred_zone_by_session_label = preferred_zone_by_session_label or {}
+    preferred_zone_by_session = preferred_zone_by_session or {}
     inv_day_usage: Dict[Tuple[str, str], int] = defaultdict(int)
     inv_total_usage: Dict[str, int] = defaultdict(int)
 
@@ -261,6 +279,7 @@ def assign_rooms_and_invigilators(
 
     for (slot_day, slot_session), exam_list in by_slot.items():
         used_ids: Set[str] = set()
+        slot_rooms_used_by_format: Dict[int, int] = defaultdict(int)
         for sched_exam in sorted(
             exam_list,
             key=lambda x: exam_map[x.exam_id].size if x.exam_id in exam_map else 0,
@@ -271,18 +290,36 @@ def assign_rooms_and_invigilators(
                 continue
             need = exam.size
             fmt = int(getattr(exam, "exam_format", 1) or 1)
+            sess_lbl = str(getattr(sched_exam, "session_label", "") or "").strip()
+            sess_no = int(getattr(sched_exam, "session", 1) or 1)
+            preferred_zone = (
+                preferred_zone_by_session_label.get(sess_lbl)
+                or preferred_zone_by_session.get(sess_no)
+                or ""
+            )
             eligible = [r for r in room_pool if r.room_id not in used_ids]
             eligible = _eligible_rooms(fmt, eligible)
+            if preferred_zone:
+                z = str(preferred_zone).strip().upper()
+                eligible.sort(key=lambda r: (0 if _zone_key(r) == z else 1, -r.capacity))
 
             if fmt == 3:
                 assigned = _pick_rooms_oral(eligible, need)
             elif fmt == 2:
                 assigned = _pick_rooms_utilization_prefer_same_zone(
-                    need, eligible, computer_fill_low, computer_fill_high
+                    need,
+                    eligible,
+                    computer_fill_low,
+                    computer_fill_high,
+                    target_students_per_room=target_students_per_room_by_exam_format.get(2),
                 )
             else:
                 assigned = _pick_rooms_utilization_prefer_same_zone(
-                    need, eligible, theory_fill_low, theory_fill_high
+                    need,
+                    eligible,
+                    theory_fill_low,
+                    theory_fill_high,
+                    target_students_per_room=target_students_per_room_by_exam_format.get(1),
                 )
 
             seats = sum(r.capacity for r in assigned)
@@ -294,10 +331,18 @@ def assign_rooms_and_invigilators(
             for r in assigned:
                 used_ids.add(r.room_id)
             sched_exam.room_ids = [r.room_id for r in assigned]
+            slot_rooms_used_by_format[fmt] += len(assigned)
+            if (
+                max_rooms_per_slot_per_format > 0
+                and slot_rooms_used_by_format[fmt] > int(max_rooms_per_slot_per_format)
+            ):
+                report.soft_warnings.append(
+                    f"Vượt ngưỡng mềm {max_rooms_per_slot_per_format} phòng "
+                    f"loại {fmt} tại {slot_day} ca {slot_session} "
+                    f"(đang dùng {slot_rooms_used_by_format[fmt]})."
+                )
             groups = _partition_students_across_rooms(exam.student_ids, assigned)
             sched_exam.room_student_groups = groups
-            sess_lbl = str(getattr(sched_exam, "session_label", "") or "")
-            sess_no = int(getattr(sched_exam, "session", 1) or 1)
             pfx7 = str(getattr(exam, "course_prefix_7", "") or "")
             sched_exam.room_split_codes = [
                 format_ma_phong_chia(pfx7, sess_lbl, sess_no, ri + 1) for ri in range(len(assigned))

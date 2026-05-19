@@ -276,6 +276,11 @@ def solve(
     student_cohort_codes: Dict[str, str] | None = None,
     year1_cohort_anchor: int = 0,
     year1_allow_same_day: bool = True,
+    preferred_session_by_prefix7: Dict[str, int] | None = None,
+    weekday_session_bonus: Dict[Tuple[int, int], float] | None = None,
+    pattern_weight: float = 1.0,
+    max_rooms_per_slot_per_format: int = 50,
+    estimated_students_per_room_by_exam_format: Dict[int, float] | None = None,
 ) -> SolveResult:
     """Entry point chính.
 
@@ -297,10 +302,37 @@ def solve(
 
     progress(5, "Đang phân tích xung đột và chuẩn bị bước tham lam…")
     conflicts = build_conflict_index(exams)
+    large_instance = len(exams) >= 1000 or len(conflicts) >= 80_000
+    effective_lns_iterations = int(lns_iterations)
+    effective_lns_pool = int(lns_pool_size)
+    if large_instance:
+        effective_lns_iterations = min(max(2, effective_lns_iterations), 4)
+        effective_lns_pool = min(max(120, effective_lns_pool), 180)
 
     prefix_totals: Dict[str, int] = {}
     if weekend_large_course_min_students > 0:
         prefix_totals = build_prefix_student_totals(exams)
+
+    if estimated_students_per_room_by_exam_format is None:
+        estimated_students_per_room_by_exam_format = {1: 40.0, 2: 35.0, 3: 28.0}
+    if rooms:
+        by_fmt_caps: Dict[int, List[int]] = defaultdict(list)
+        for r in rooms:
+            code = int(getattr(r, "room_format_code", 0) or 0)
+            cap = int(getattr(r, "capacity", 0) or 0)
+            if code in (1, 2, 3) and cap > 0:
+                by_fmt_caps[code].append(cap)
+        for code in (1, 2, 3):
+            caps = by_fmt_caps.get(code, [])
+            if caps:
+                caps_sorted = sorted(caps)
+                mid = len(caps_sorted) // 2
+                med = (
+                    float(caps_sorted[mid])
+                    if len(caps_sorted) % 2 == 1
+                    else (float(caps_sorted[mid - 1]) + float(caps_sorted[mid])) / 2.0
+                )
+                estimated_students_per_room_by_exam_format[code] = max(1.0, med)
 
     total_capacity = sum(r.capacity for r in rooms) if rooms else None
 
@@ -310,6 +342,10 @@ def solve(
         relaxations.append(
             f"Áp dụng Ke_hoach_thi theo Khoa_lop*: {len(window.khoa_lop_windows)} mã lớp, "
             f"{n_distinct} khoảng ngày đợt thi."
+        )
+    if large_instance:
+        relaxations.append(
+            "Instance lớn: rút gọn số vòng LNS để giảm thời gian chạy nhưng vẫn giữ ràng buộc cứng."
         )
 
     # ---- Greedy phase ----
@@ -334,6 +370,11 @@ def solve(
         student_cohort_codes=student_cohort_codes,
         year1_cohort_anchor=year1_cohort_anchor,
         year1_allow_same_day=year1_allow_same_day,
+        preferred_session_by_prefix7=preferred_session_by_prefix7,
+        weekday_session_bonus=weekday_session_bonus,
+        pattern_weight=pattern_weight,
+        max_rooms_per_slot_per_format=max_rooms_per_slot_per_format,
+        estimated_students_per_room_by_exam_format=estimated_students_per_room_by_exam_format,
     )
     relaxations.extend(greedy.relaxations)
 
@@ -351,10 +392,10 @@ def solve(
     lns_logs: List[str] = []
 
     # ---- LNS post-improvement (rẻ và hiệu quả, luôn chạy khi optimize=True) ----
-    if optimize_objective and lns_iterations > 0 and final_assignment:
+    if optimize_objective and effective_lns_iterations > 0 and final_assignment:
         progress(
             50,
-            f"Bước 2/3: đang cải tiến LNS trên {lns_pool_size} môn vi phạm ngày ôn nhiều nhất…",
+            f"Bước 2/3: đang cải tiến LNS trên {effective_lns_pool} môn vi phạm ngày ôn nhiều nhất…",
         )
         try:
             improved, lns_logs = lns_improve(
@@ -365,8 +406,8 @@ def solve(
                 max_exams_per_day=max_exams_per_day,
                 min_prep_days=min_prep_days,
                 prep_day_per_credit=prep_day_per_credit,
-                iterations=lns_iterations,
-                pool_size=lns_pool_size,
+                iterations=effective_lns_iterations,
+                pool_size=effective_lns_pool,
                 soft_slot_cap=soft_slot_cap,
                 fixed_slots=fixed_slots,
                 session_half=session_half,
@@ -382,7 +423,11 @@ def solve(
                 final_assignment = improved
                 method = "greedy+lns"
             # Vòng LNS thứ hai khi vẫn còn hàng nghìn vi phạm (thường sau nới ôn khóa sau).
-            if final_assignment and len(final_assignment) >= len(exams) * 0.98:
+            if (
+                not large_instance
+                and final_assignment
+                and len(final_assignment) >= len(exams) * 0.98
+            ):
                 tmp_sched = heuristic_to_scheduled(
                     HeuristicResult(assignment=final_assignment, unplaced=[], relaxations=[]),
                     exams,
@@ -420,8 +465,8 @@ def solve(
                         max_exams_per_day=max_exams_per_day,
                         min_prep_days=min_prep_days,
                         prep_day_per_credit=prep_day_per_credit,
-                        iterations=max(8, lns_iterations),
-                        pool_size=min(400, lns_pool_size + 100),
+                        iterations=max(8, effective_lns_iterations),
+                        pool_size=min(400, effective_lns_pool + 100),
                         soft_slot_cap=soft_slot_cap,
                         fixed_slots=fixed_slots,
                         session_half=session_half,
@@ -472,8 +517,8 @@ def solve(
                                 max_exams_per_day=max_exams_per_day,
                                 min_prep_days=min_prep_days,
                                 prep_day_per_credit=prep_day_per_credit,
-                                iterations=max(12, lns_iterations),
-                                pool_size=min(450, lns_pool_size + 150),
+                                iterations=max(12, effective_lns_iterations),
+                                pool_size=min(450, effective_lns_pool + 150),
                                 soft_slot_cap=soft_slot_cap,
                                 fixed_slots=fixed_slots,
                                 session_half=session_half,

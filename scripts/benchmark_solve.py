@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROOT))
 
 from engine.diagnostics import build_student_cohort_code_map, build_student_cohort_map, compute_kpi
 from engine.io import build_exams, load_registrations, load_rooms, load_schedule_window
+from engine.manual_pattern import build_manual_pattern_profile
 from engine.scheduler import detect_prep_violations, solve
 
 DATA = ROOT / "data"
@@ -60,6 +61,11 @@ def main():
     codes = build_student_cohort_code_map(exams, registrations=regs, year1_anchor=25)
     cohort = build_student_cohort_map(exams, student_cohort_codes=codes, year1_anchor=25)
     allowed = {e.exam_id: ALLOWED_BY_TYPE.get(e.exam_type, list(range(12))) for e in exams}
+    manual_pattern = build_manual_pattern_profile(
+        common_schedule_path=DATA / "2510DanhSachThiChung.xlsx",
+        invigilator_schedule_path=DATA / "ALL_ALL_LThiGV_2510.xlsx",
+        session_labels=SESSION_LABELS,
+    )
 
     t0 = time.time()
     result = solve(
@@ -82,6 +88,9 @@ def main():
         student_cohort_codes=codes,
         year1_cohort_anchor=25,
         year1_allow_same_day=True,
+        preferred_session_by_prefix7=manual_pattern.preferred_session_by_prefix7,
+        weekday_session_bonus=manual_pattern.weekday_session_bonus,
+        pattern_weight=1.0,
     )
     elapsed = time.time() - t0
     scheduled = result.scheduled

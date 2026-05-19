@@ -12,6 +12,10 @@ class Registration:
     section_id: str
     course_name: str
     credits: float
+    ma_hoc_phan: str = ""
+    khoa: str = ""
+    khoa_lop: str = ""
+    priority_order: int = 0
     # Theo bảng mã: 1=Tự luận, 2=Trắc nghiệm, 3=Vấn đáp — None = suy từ tên môn
     exam_format: int | None = None
 
@@ -27,6 +31,8 @@ class Exam:
     student_ids: List[str]
     exam_format: int = 1  # 1=Tự luận, 2=Trắc nghiệm, 3=Vấn đáp (đồng bộ phân phòng)
     course_prefix_7: str = ""  # 7 ký tự trái MalopHP — cùng mã nhiều ca → cùng buổi
+    khoa_lop_keys: List[str] = field(default_factory=list)  # Khóa_Lớp explicit từ dữ liệu
+    cohort_codes: List[str] = field(default_factory=list)  # Khóa explicit (2 ký tự)
     priority: int = 0  # >0: ưu tiên xếp cuối đợt (PBL/đồ án)
     prep_days: float = 0.0  # số ngày ôn khuyến nghị
 

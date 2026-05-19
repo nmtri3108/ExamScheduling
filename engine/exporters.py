@@ -39,6 +39,9 @@ def _exam_nien_khoa_cell(exam: Exam | None) -> str:
     """Niên khóa: 2 ký tự đầu của 4 ký tự cuối MalopHP (theo từng lớp trong ca thi)."""
     if exam is None:
         return ""
+    explicit = sorted({str(c).strip() for c in getattr(exam, "cohort_codes", []) if str(c).strip()})
+    if explicit:
+        return ", ".join(explicit)
     codes = sorted(
         {c for s in exam.section_ids if (c := cohort_code_from_malop(s))}
     )

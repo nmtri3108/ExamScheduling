@@ -78,6 +78,11 @@ def schedule_greedy(
     student_cohort_codes: Dict[str, str] | None = None,
     year1_cohort_anchor: int = 0,
     year1_allow_same_day: bool = True,
+    preferred_session_by_prefix7: Dict[str, int] | None = None,
+    weekday_session_bonus: Dict[Tuple[int, int], float] | None = None,
+    pattern_weight: float = 1.0,
+    max_rooms_per_slot_per_format: int = 50,
+    estimated_students_per_room_by_exam_format: Dict[int, float] | None = None,
 ) -> HeuristicResult:
     """Trả về HeuristicResult với map exam_id -> slot.
 
@@ -87,6 +92,11 @@ def schedule_greedy(
     allowed_sessions_by_exam_id = allowed_sessions_by_exam_id or {}
     fixed_slots = dict(fixed_slots or {})
     base_slots = dict(base_slots or {})
+    preferred_session_by_prefix7 = preferred_session_by_prefix7 or {}
+    weekday_session_bonus = weekday_session_bonus or {}
+    estimated_students_per_room_by_exam_format = (
+        estimated_students_per_room_by_exam_format or {1: 40.0, 2: 35.0, 3: 28.0}
+    )
 
     conflicts = build_conflict_index(exams)
     # adjacency: exam_idx -> {exam_idx: overlap}
@@ -115,6 +125,22 @@ def schedule_greedy(
     _SUNDAY_SPREAD_MIN = 3          # giãn tối thiểu so với môn CN (vd Vật lý CN → Giải tích ≥3 ngày)
     _SUNDAY_SPREAD_WEIGHT = 8.0    # phạt mềm mạnh khi SV trùng môn thi CN mà xếp quá gần
     assignment: Dict[str, int] = {}
+    slot_room_demand_by_format: Dict[Tuple[int, int], float] = defaultdict(float)
+
+    def _exam_format_code(idx: int) -> int:
+        try:
+            return int(getattr(exams[idx], "exam_format", 1) or 1)
+        except (TypeError, ValueError):
+            return 1
+
+    def _estimated_rooms_for_exam(idx: int) -> float:
+        exam = exams[idx]
+        fmt = _exam_format_code(idx)
+        if fmt == 3:
+            return 1.0
+        per_room = float(estimated_students_per_room_by_exam_format.get(fmt, 36.0) or 36.0)
+        per_room = max(1.0, per_room)
+        return max(1.0, float(exam.size) / per_room)
 
     # Mục tiêu phân bố đều: tổng SV / số ngày (giúp scoring biết khi nào "quá tải")
     total_student_demand = sum(e.size for e in exams)
@@ -234,6 +260,8 @@ def schedule_greedy(
         slot_load_students[slot] += exam.size
         day_load_students[day] += exam.size
         assignment[exam_id] = slot
+        fmt = _exam_format_code(idx)
+        slot_room_demand_by_format[(slot, fmt)] += _estimated_rooms_for_exam(idx)
         if weekday_at_day_index(window, day) == 6:
             sunday_exam_days.add(day)
         if session_half and exam.course_prefix_7:
@@ -435,6 +463,8 @@ def schedule_greedy(
         slot_load_students[slot] += exam.size
         day_load_students[day] += exam.size
         assignment[exam.exam_id] = slot
+        fmt = _exam_format_code(idx)
+        slot_room_demand_by_format[(slot, fmt)] += _estimated_rooms_for_exam(idx)
         for k in exam_khoa_keys[idx]:
             day_khoa_registry[(day, k)].append(idx)
         if weekday_at_day_index(window, day) == 6:
@@ -462,6 +492,10 @@ def schedule_greedy(
             if not student_day_exams[sid]:
                 del student_day_exams[sid]
         slot_load_students[slot] -= exam.size
+        fmt = _exam_format_code(idx)
+        slot_room_demand_by_format[(slot, fmt)] -= _estimated_rooms_for_exam(idx)
+        if slot_room_demand_by_format[(slot, fmt)] <= 1e-9:
+            slot_room_demand_by_format.pop((slot, fmt), None)
         day_load_students[day] -= exam.size
         for k in exam_khoa_keys[idx]:
             reg = day_khoa_registry.get((day, k), [])
@@ -634,6 +668,25 @@ def schedule_greedy(
                 scale_sv = len(exam.student_ids) / max(1, len(sample_sv))
                 spread_w = max(0.01, float(spread_prep_factor))
                 score += sunday_deficit_sq * scale_sv * _SUNDAY_SPREAD_WEIGHT * spread_w
+
+        # (6) Pattern học từ lịch chia tay: ưu tiên đúng ca quen thuộc theo mã học phần + thứ/ca.
+        if pattern_weight > 0:
+            pfx = str(exam.course_prefix_7 or "").strip()
+            pref_sess = preferred_session_by_prefix7.get(pfx)
+            if pref_sess is not None:
+                score += abs(int(sess) - int(pref_sess)) * 4.0 * float(pattern_weight)
+            wd = weekday_at_day_index(window, day)
+            bonus = float(weekday_session_bonus.get((int(wd), int(sess)), 0.0))
+            if bonus > 0:
+                score -= bonus * 6.0 * float(pattern_weight)
+
+        # (7) Soft constraint phòng: không quá 50 phòng/ca theo từng loại phòng thi.
+        if max_rooms_per_slot_per_format > 0:
+            fmt = _exam_format_code(idx)
+            projected_rooms = slot_room_demand_by_format.get((slot, fmt), 0.0) + _estimated_rooms_for_exam(idx)
+            overflow = projected_rooms - float(max_rooms_per_slot_per_format)
+            if overflow > 0:
+                score += (overflow ** 2) * 180.0
 
         return score
 
@@ -1156,7 +1209,17 @@ def schedule_greedy(
                 "(gom lớp khác đợt hoặc thiếu ngày — xem «Môn chưa xếp»)."
             )
 
-    repaired = _greedy_repair_prep(rounds=5) + _greedy_repair_prep(rounds=10, year1_only=True)
+    large_instance = n >= 1000 or len(conflicts) >= 80_000
+    greedy_rounds_all = 2 if large_instance else 5
+    greedy_rounds_year1 = 5 if large_instance else 10
+    prep_rounds_year1 = 10 if large_instance else 28
+    prep_rounds_all = 12 if large_instance else 32
+    break_same_day_passes = 6 if large_instance else 12
+    tail_repair_rounds = 6 if large_instance else 12
+
+    repaired = _greedy_repair_prep(rounds=greedy_rounds_all) + _greedy_repair_prep(
+        rounds=greedy_rounds_year1, year1_only=True
+    )
 
     def _repair_prep_gaps(
         max_rounds: int = 24,
@@ -1266,21 +1329,27 @@ def schedule_greedy(
         return moved
 
     # Cuối pipeline: sửa ôn mọi khóa (ưu tiên anchor trước).
-    y1_fixed = _repair_prep_gaps(max_rounds=28, year1_only=True)
-    all_fixed = _repair_prep_gaps(max_rounds=32, year1_only=False, max_wave=None)
+    y1_fixed = _repair_prep_gaps(max_rounds=prep_rounds_year1, year1_only=True)
+    all_fixed = _repair_prep_gaps(max_rounds=prep_rounds_all, year1_only=False, max_wave=None)
     repaired += y1_fixed + all_fixed
-    repaired += _greedy_repair_prep(rounds=10)
+    repaired += _greedy_repair_prep(rounds=greedy_rounds_year1)
     sd_tail = _count_same_day_violation_pairs()
     if sd_tail > 0:
-        broken_tail = _break_same_day_pairs(max_passes=12)
+        broken_tail = _break_same_day_pairs(max_passes=break_same_day_passes)
         repaired += broken_tail
         if broken_tail > 0:
-            repaired += _repair_prep_gaps(max_rounds=12, year1_only=False, max_wave=None)
-            repaired += _greedy_repair_prep(rounds=4)
+            repaired += _repair_prep_gaps(
+                max_rounds=tail_repair_rounds, year1_only=False, max_wave=None
+            )
+            repaired += _greedy_repair_prep(rounds=max(2, greedy_rounds_all))
     if repaired > 0:
         relaxations.append(
             f"Sửa sau greedy: đã chuyển {repaired} ca để giảm vi phạm ôn/CN "
             f"(khóa {year1_anchor:02d}: {y1_fixed}, mọi khóa: {all_fixed})."
+        )
+    if large_instance:
+        relaxations.append(
+            "Instance lớn: rút gọn số vòng repair hậu-greedy để giảm thời gian chạy."
         )
 
     unplaced = [e.exam_id for e in exams if e.exam_id not in assignment]

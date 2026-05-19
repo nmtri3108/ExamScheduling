@@ -35,6 +35,7 @@ from engine.io import (
     load_schedule_window,
 )
 from engine.i18n import hien_thi_loai_hinh, hien_thi_phuong_thuc, markdown_canh_bao_hoc_phan_thieu_ngay_on
+from engine.manual_pattern import build_manual_pattern_profile
 from engine.rooms import assign_rooms_and_invigilators
 from engine.scheduler import detect_prep_violations, solve
 
@@ -130,6 +131,12 @@ def _run_pipeline(
     student_cohort_codes=None,
     year1_cohort_anchor=0,
     year1_allow_same_day=True,
+    preferred_session_by_prefix7=None,
+    weekday_session_bonus=None,
+    pattern_weight=1.0,
+    target_students_per_room_by_exam_format=None,
+    preferred_zone_by_session_label=None,
+    max_rooms_per_slot_per_format=50,
 ):
     """Một bước: chẩn đoán → solve → phân phòng → vi phạm → KPI."""
     started = time.time()
@@ -174,6 +181,10 @@ def _run_pipeline(
         student_cohort_codes=student_cohort_codes,
         year1_cohort_anchor=int(year1_cohort_anchor or 0),
         year1_allow_same_day=bool(year1_allow_same_day),
+        preferred_session_by_prefix7=preferred_session_by_prefix7,
+        weekday_session_bonus=weekday_session_bonus,
+        pattern_weight=float(pattern_weight),
+        max_rooms_per_slot_per_format=int(max_rooms_per_slot_per_format),
     )
 
     room_report = assign_rooms_and_invigilators(
@@ -186,6 +197,9 @@ def _run_pipeline(
         theory_fill_high=float(theory_fill_high),
         computer_fill_low=float(computer_fill_low),
         computer_fill_high=float(computer_fill_high),
+        target_students_per_room_by_exam_format=target_students_per_room_by_exam_format,
+        preferred_zone_by_session_label=preferred_zone_by_session_label,
+        max_rooms_per_slot_per_format=int(max_rooms_per_slot_per_format),
     )
 
     violations = detect_prep_violations(
@@ -324,7 +338,7 @@ with st.sidebar:
         solver_time_limit = st.number_input(
             "Giới hạn thời gian cho bước tối ưu (giây)",
             min_value=10,
-            value=600,
+            value=240,
             step=10,
             help="Chủ yếu áp dụng cho bước tối ưu ràng buộc (SAT). Bước tham lam + LNS thường xong trước đó.",
         )
@@ -339,6 +353,17 @@ with st.sidebar:
             help=(
                 "Nếu vẫn còn môn chưa đặt sau bước tham lam, chỉ ghi log gợi ý — "
                 "không chạy lại với min_prep_days=0 (tránh làm vỡ ngày ôn theo tín chỉ)."
+            ),
+        )
+        pattern_weight = st.slider(
+            "Mức học theo pattern chia tay (nếu có file mẫu)",
+            min_value=0.0,
+            max_value=3.0,
+            value=1.0,
+            step=0.1,
+            help=(
+                "0 = tắt. >0: ưu tiên ca/nhịp thứ-ca giống file bạn đã chia tay "
+                "(2510DanhSachThiChung + ALL_ALL_LThiGV_2510) nếu các file này có trong thư mục data."
             ),
         )
 
@@ -403,11 +428,11 @@ with st.sidebar:
             "Số vòng sửa lịch cục bộ (LNS)",
             min_value=0,
             max_value=15,
-            value=10,
+            value=4,
             step=1,
             help=(
                 "Mỗi vòng xử lý ~200 môn vi phạm ôn nặng nhất. "
-                "Mặc định 10 vòng (khuyên 10–12) khi ~1.600 ca và còn hàng nghìn vi phạm ôn; 0 = tắt LNS."
+                "Mặc định 4 vòng (đủ tốt cho dữ liệu lớn, chạy nhanh hơn); 0 = tắt LNS."
             ),
         )
 
@@ -434,6 +459,14 @@ with st.sidebar:
             computer_fill_high = st.number_input(
                 "Máy — tỉ lệ tối đa", min_value=0.5, max_value=1.0, value=0.95, step=0.01,
             )
+        max_rooms_per_slot_per_format = st.number_input(
+            "Ngưỡng mềm phòng/ca theo mỗi loại phòng",
+            min_value=1,
+            max_value=200,
+            value=50,
+            step=1,
+            help="Ràng buộc mềm: ưu tiên không quá N phòng/ca cho từng mã loại phòng (1/2/3).",
+        )
 
 # ---------------------------------------------------------------------------
 # Upload + Run
@@ -453,7 +486,8 @@ with up_col1:
         "Bước 2 — Danh sách sinh viên đăng ký (DSSV_*.xlsx)",
         type=["xlsx"],
         help=(
-            "Bắt buộc. Cột: MaHS, TenSV, MalopHP, TenLopHP, SoTC. "
+            "Bắt buộc. Cột tối thiểu: MaHS, TenSV, TenLopHP, SoTC và (MalopHP hoặc MaHocPhan). "
+            "Khuyến nghị dùng thêm Khóa, Khóa_Lớp, MaHocPhan để engine không phải cắt từ MalopHP. "
             "Tuỳ chọn MaHinhThuc: 1 = tự luận, 2 = trắc nghiệm máy, 3 = vấn đáp (để trống thì suy từ tên môn). "
             "Quy tắc Khoa_nhom: **4 ký tự cuối** MalopHP — hai môn khác học phần mà trùng hậu tố này không thi cùng một ngày."
         ),
@@ -532,6 +566,16 @@ if run_btn:
                 for e in exams
             }
             student_name_map = {sid: r.student_name for sid, r in student_ref.items()}
+            data_dir = Path(__file__).resolve().parent / "data"
+            common_ref = data_dir / "2510DanhSachThiChung.xlsx"
+            inv_ref = data_dir / "ALL_ALL_LThiGV_2510.xlsx"
+            manual_pattern = build_manual_pattern_profile(
+                common_schedule_path=common_ref if common_ref.exists() else None,
+                invigilator_schedule_path=inv_ref if inv_ref.exists() else None,
+                session_labels=session_labels,
+            )
+            if manual_pattern.notes and float(pattern_weight) > 0:
+                st.info("Pattern học từ lịch chia tay:\n\n" + "\n".join(f"- {n}" for n in manual_pattern.notes))
 
         outcome = _run_pipeline(
             exams=exams,
@@ -563,6 +607,12 @@ if run_btn:
             student_cohort_codes=student_cohort_codes,
             year1_cohort_anchor=y1_anchor,
             year1_allow_same_day=bool(year1_allow_same_day),
+            preferred_session_by_prefix7=manual_pattern.preferred_session_by_prefix7,
+            weekday_session_bonus=manual_pattern.weekday_session_bonus,
+            pattern_weight=float(pattern_weight),
+            target_students_per_room_by_exam_format=manual_pattern.target_students_per_room_by_exam_format,
+            preferred_zone_by_session_label=manual_pattern.preferred_zone_by_session_label,
+            max_rooms_per_slot_per_format=int(max_rooms_per_slot_per_format),
         )
 
         st.session_state["scheduler_data"] = {
@@ -601,6 +651,16 @@ if run_btn:
                 "session_half": list(session_half),
                 "weekend_large_course_min_students": int(weekend_large_min_sv),
                 "spread_prep_factor": float(spread_prep_factor),
+                "pattern_weight": float(pattern_weight),
+                "preferred_session_by_prefix7": dict(manual_pattern.preferred_session_by_prefix7),
+                "weekday_session_bonus": {
+                    f"{k[0]}_{k[1]}": float(v) for k, v in manual_pattern.weekday_session_bonus.items()
+                },
+                "target_students_per_room_by_exam_format": dict(
+                    manual_pattern.target_students_per_room_by_exam_format
+                ),
+                "preferred_zone_by_session_label": dict(manual_pattern.preferred_zone_by_session_label),
+                "max_rooms_per_slot_per_format": int(max_rooms_per_slot_per_format),
             },
         }
         n_placed = len(outcome["result"].scheduled)
@@ -847,6 +907,11 @@ with tabs[4]:
         c2.metric("Quá tải", len(room_report.overflows))
         if room_report.overflows:
             st.error("Sự cố sức chứa:\n\n" + "\n".join(f"- {x}" for x in room_report.overflows[:30]))
+        if getattr(room_report, "soft_warnings", None):
+            st.warning(
+                "Cảnh báo mềm:\n\n"
+                + "\n".join(f"- {x}" for x in (room_report.soft_warnings[:20]))
+            )
         if room_report.room_usage:
             usage_df = pd.DataFrame(
                 sorted(room_report.room_usage.items(), key=lambda x: -x[1]),
@@ -960,6 +1025,18 @@ with tabs[5]:
                     student_cohort_codes=state.get("student_cohort_codes"),
                     year1_cohort_anchor=int(cfg.get("year1_cohort_anchor", 0) or 0),
                     year1_allow_same_day=bool(cfg.get("year1_allow_same_day", True)),
+                    preferred_session_by_prefix7=cfg.get("preferred_session_by_prefix7", {}),
+                    weekday_session_bonus={
+                        tuple(map(int, k.split("_"))): float(v)
+                        for k, v in (cfg.get("weekday_session_bonus", {}) or {}).items()
+                        if "_" in str(k)
+                    },
+                    pattern_weight=float(cfg.get("pattern_weight", 1.0)),
+                    target_students_per_room_by_exam_format=cfg.get(
+                        "target_students_per_room_by_exam_format", {}
+                    ),
+                    preferred_zone_by_session_label=cfg.get("preferred_zone_by_session_label", {}),
+                    max_rooms_per_slot_per_format=int(cfg.get("max_rooms_per_slot_per_format", 50)),
                 )
                 state["outcome"] = new_outcome
                 st.session_state["scheduler_data"] = state

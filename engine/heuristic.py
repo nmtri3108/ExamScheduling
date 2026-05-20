@@ -138,7 +138,11 @@ def schedule_greedy(
             return 1.0
         per_room = float(estimated_students_per_room_by_exam_format.get(fmt, 36.0) or 36.0)
         per_room = max(1.0, per_room)
-        return max(1.0, float(exam.size) / per_room)
+        est = max(1.0, float(exam.size) / per_room)
+        # Biên an toàn để tránh under-estimate số phòng thực tế (đặc biệt lý thuyết/máy).
+        if fmt in (1, 2):
+            est *= 1.08
+        return est
 
     # Mục tiêu phân bố đều: tổng SV / số ngày (giúp scoring biết khi nào "quá tải")
     total_student_demand = sum(e.size for e in exams)
@@ -316,13 +320,6 @@ def schedule_greedy(
                 ]
         return slots
 
-    def _room_slot_cap_ok(idx: int, slot: int) -> bool:
-        if max_rooms_per_slot_per_format <= 0:
-            return True
-        fmt = _exam_format_code(idx)
-        projected_rooms = slot_room_demand_by_format.get((slot, fmt), 0.0) + _estimated_rooms_for_exam(idx)
-        return projected_rooms <= float(max_rooms_per_slot_per_format) + 1e-9
-
     def _try_place(
         idx: int,
         slot: int,
@@ -333,7 +330,6 @@ def schedule_greedy(
         ignore_khoa_nhom: bool = False,
         ignore_prefix_anchor: bool = False,
         ignore_sunday_spread: bool = False,
-        ignore_room_slot_cap: bool = False,
     ) -> bool:
         exam = exams[idx]
         day, _ = _slot_to_day_session(slot, window.sessions_per_day)
@@ -352,8 +348,6 @@ def schedule_greedy(
                 lim = _max_exams_per_day_for_student(sid)
                 if lim > 0 and day_exams_per_student[(sid, day)] >= lim:
                     return False
-        if not ignore_room_slot_cap and not _room_slot_cap_ok(idx, slot):
-            return False
         # Ôn cứng: mọi SV khi chưa nới; nới chỉ bỏ ôn khóa cũ, giữ cứng cho năm 1.
         # Năm 1 được thi cùng ngày; giữa hai ngày khác nhau cần đủ ngày ôn theo tín chỉ.
         if min_prep_days > 0 or prep_day_per_credit > 0:
@@ -408,8 +402,6 @@ def schedule_greedy(
 
     def _force_commit(idx: int, slot: int) -> None:
         """Đặt bắt buộc — không kiểm ràng buộc (chỉ dùng khi ca không có SV khóa năm 1)."""
-        if not _room_slot_cap_ok(idx, int(slot)):
-            return
         _commit(idx, int(slot))
 
     def _safe_force_place(
@@ -599,10 +591,16 @@ def schedule_greedy(
         if day_ratio > 1.0:
             balance_pen += (day_ratio - 1.0) ** 2 * 100.0
         elif eff_day_count > 1 and day_ratio < 0.82:
-            # Khuyến khích dùng ngày còn trống — giảm đỉnh tải (gần lịch xếp tay).
-            balance_pen += (0.82 - day_ratio) ** 2 * 30.0
+            # Thưởng nhẹ khi dùng ngày còn trống để dàn lịch, giảm vi phạm ôn.
+            balance_pen -= (0.82 - day_ratio) ** 2 * 50.0
         if slot_ratio > 1.0:
             balance_pen += (slot_ratio - 1.0) ** 2 * 50.0
+        elif projected_slot <= max(1.0, target_per_slot * 0.75):
+            # Ưu tiên mở thêm slot khi còn thưa để giảm dồn ca.
+            balance_pen -= ((max(1.0, target_per_slot * 0.75) - projected_slot) / max(1.0, target_per_slot)) * 14.0
+        if slot_load_students[slot] <= 0:
+            # Bonus nhỏ cho slot hoàn toàn mới.
+            balance_pen -= 3.0
 
         # Soft cap = "nearly hard": phạt bậc 3 khi vượt, hệ số rất lớn.
         # Nếu cap đặt và slot này đã có exam.size làm vượt → coi như cấm trừ khi không còn lựa chọn.

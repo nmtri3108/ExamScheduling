@@ -463,9 +463,9 @@ with st.sidebar:
             "Ngưỡng mềm phòng/ca theo mỗi loại phòng",
             min_value=1,
             max_value=200,
-            value=50,
+            value=48,
             step=1,
-            help="Ràng buộc mềm: ưu tiên không quá N phòng/ca cho từng mã loại phòng (1/2/3).",
+            help="Ràng buộc mềm: ưu tiên không quá N phòng/ca cho từng mã loại phòng (1/2/3). Khuyên <50 để phù hợp năng lực coi thi thực tế.",
         )
 
 # ---------------------------------------------------------------------------
@@ -1036,7 +1036,7 @@ with tabs[5]:
                         "target_students_per_room_by_exam_format", {}
                     ),
                     preferred_zone_by_session_label=cfg.get("preferred_zone_by_session_label", {}),
-                    max_rooms_per_slot_per_format=int(cfg.get("max_rooms_per_slot_per_format", 50)),
+                    max_rooms_per_slot_per_format=int(cfg.get("max_rooms_per_slot_per_format", 48)),
                 )
                 state["outcome"] = new_outcome
                 st.session_state["scheduler_data"] = state
